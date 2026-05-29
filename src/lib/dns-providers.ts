@@ -200,6 +200,16 @@ export const DNS_PROVIDERS: DnsProviderDefinition[] = [
       { key: "api_token", label: "API Token", type: "password", required: true },
     ],
   },
+  {
+    name: "infomaniak",
+    displayName: "Infomaniak",
+    description: "Infomaniak DNS API",
+    docsUrl: "https://github.com/caddy-dns/infomaniak",
+    modulePath: "github.com/caddy-dns/infomaniak",
+    fields: [
+      { key: "api_token", label: "API Token", type: "password", required: true },
+    ],
+  },
 ];
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
