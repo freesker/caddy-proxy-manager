@@ -1,3 +1,11 @@
+import type { BaseSQLiteDatabase } from "drizzle-orm/sqlite-core";
+import { and, eq, inArray } from "drizzle-orm";
+import { groupMembers, oauthRoleMappings } from "../db/schema";
+
+/** Accepte aussi bien le driver bun-sqlite (prod) que better-sqlite3 (tests) — tous deux synchrones. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type SyncDb = BaseSQLiteDatabase<"sync", any, any, any>;
+
 export const DEFAULT_ROLES_CLAIM = "realm_access.roles";
 
 /** Décode le payload d'un JWT (sans vérification — déjà validé en amont par better-auth). */
@@ -53,4 +61,55 @@ export function computeMembershipChanges(input: {
   const toAdd = [...target].filter((g) => !current.has(g));
   const toRemove = [...current].filter((g) => managed.has(g) && !target.has(g));
   return { toAdd, toRemove };
+}
+
+export async function syncUserGroupsFromRoles(
+  database: SyncDb,
+  userId: number,
+  providerId: string,
+  roles: string[] | undefined
+): Promise<{ skipped: boolean; added: number[]; removed: number[] }> {
+  if (roles === undefined) {
+    console.warn(
+      `[oidc-role-sync] roles claim absent for user ${userId} (provider ${providerId}); skipping group sync`
+    );
+    return { skipped: true, added: [], removed: [] };
+  }
+
+  const mappings = await database
+    .select({ role: oauthRoleMappings.role, groupId: oauthRoleMappings.groupId })
+    .from(oauthRoleMappings)
+    .where(eq(oauthRoleMappings.providerId, providerId));
+
+  if (mappings.length === 0) return { skipped: false, added: [], removed: [] };
+
+  const managedGroupIds = [...new Set(mappings.map((m) => m.groupId))];
+  const roleSet = new Set(roles);
+  const targetGroupIds = [
+    ...new Set(mappings.filter((m) => roleSet.has(m.role)).map((m) => m.groupId)),
+  ];
+
+  const currentRows = await database
+    .select({ groupId: groupMembers.groupId })
+    .from(groupMembers)
+    .where(eq(groupMembers.userId, userId));
+  const currentGroupIds = currentRows.map((r) => r.groupId);
+
+  const { toAdd, toRemove } = computeMembershipChanges({
+    managedGroupIds,
+    targetGroupIds,
+    currentGroupIds,
+  });
+
+  const now = new Date().toISOString();
+  for (const groupId of toAdd) {
+    await database.insert(groupMembers).values({ groupId, userId, createdAt: now });
+  }
+  if (toRemove.length > 0) {
+    await database
+      .delete(groupMembers)
+      .where(and(eq(groupMembers.userId, userId), inArray(groupMembers.groupId, toRemove)));
+  }
+
+  return { skipped: false, added: toAdd, removed: toRemove };
 }
