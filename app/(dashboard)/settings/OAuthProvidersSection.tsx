@@ -429,7 +429,7 @@ export default function OAuthProvidersSection({ initialProviders, baseUrl }: OAu
                 className="h-8 text-sm font-mono"
               />
               <p className="text-xs text-muted-foreground">
-                Chemin du claim contenant les rôles dans l&apos;ID token Keycloak (laisser vide = realm_access.roles).
+                Path to the roles claim in the Keycloak ID token (leave blank for realm_access.roles).
               </p>
             </div>
 

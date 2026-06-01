@@ -124,7 +124,7 @@ export default function GroupsClient({ groups, users, managedGroupIds }: Props) 
                       <h3 className="font-semibold text-base">{group.name}</h3>
                       {isManaged && (
                         <span className="text-xs rounded-full border border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-400 px-2 py-0.5">
-                          Géré par Keycloak
+                          Managed by Keycloak
                         </span>
                       )}
                     </div>
@@ -144,7 +144,7 @@ export default function GroupsClient({ groups, users, managedGroupIds }: Props) 
                       onClick={() =>
                         setAddMemberGroupId(addMemberGroupId === group.id ? null : group.id)
                       }
-                      title={isManaged ? "Appartenance pilotée par les rôles Keycloak" : "Add member"}
+                      title={isManaged ? "Membership is driven by Keycloak roles" : "Add member"}
                     >
                       <UserPlus className="h-4 w-4" />
                     </Button>
@@ -238,7 +238,7 @@ export default function GroupsClient({ groups, users, managedGroupIds }: Props) 
                               await removeGroupMemberAction(group.id, member.userId);
                               router.refresh();
                             }}
-                            title={isManaged ? "Appartenance pilotée par les rôles Keycloak" : "Remove member"}
+                            title={isManaged ? "Membership is driven by Keycloak roles" : "Remove member"}
                           >
                             <UserMinus className="h-3 w-3" />
                           </Button>

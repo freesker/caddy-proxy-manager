@@ -47,7 +47,7 @@ export async function listManagedGroupIds(): Promise<number[]> {
   return [...new Set(rows.map((r) => r.groupId))];
 }
 
-/** Nettoyage manuel — les FK ne cascadent pas en prod (bun:sqlite). DB injectée pour les tests. */
+/** Manual cleanup — FKs don't cascade in prod (bun:sqlite). DB injected for tests. */
 export async function deleteMappingsForProvider(
   database: SyncDb,
   providerId: string

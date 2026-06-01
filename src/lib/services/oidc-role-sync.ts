@@ -3,13 +3,13 @@ import { and, eq, inArray } from "drizzle-orm";
 import { accounts, groupMembers, oauthProviders, oauthRoleMappings } from "../db/schema";
 import { decryptSecret, isEncryptedSecret } from "../secret";
 
-/** Accepte aussi bien le driver bun-sqlite (prod) que better-sqlite3 (tests) — tous deux synchrones. */
+/** Accepts both the bun-sqlite driver (prod) and better-sqlite3 (tests) — both synchronous. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type SyncDb = BaseSQLiteDatabase<"sync", any, any, any>;
 
 export const DEFAULT_ROLES_CLAIM = "realm_access.roles";
 
-/** Décode le payload d'un JWT (sans vérification — déjà validé en amont par better-auth). */
+/** Decodes a JWT payload (no verification — already validated upstream by better-auth). */
 export function decodeJwtPayload(jwt: string): Record<string, unknown> | null {
   const parts = jwt.split(".");
   if (parts.length < 2) return null;
@@ -25,10 +25,10 @@ export function decodeJwtPayload(jwt: string): Record<string, unknown> | null {
 }
 
 /**
- * Extrait un tableau de rôles depuis un chemin de claim « pointé » (ex. realm_access.roles).
- * - chemin absent              → undefined (claim absent → la synchro sera SKIP)
- * - valeur non-tableau         → undefined (config probablement incorrecte → SKIP)
- * - tableau (même vide)        → string[]
+ * Extracts a roles array from a dotted claim path (e.g. realm_access.roles).
+ * - missing path     → undefined (claim absent → the sync is SKIPPED)
+ * - non-array value  → undefined (likely misconfiguration → SKIPPED)
+ * - array (even empty) → string[]
  */
 export function extractRoles(
   claims: Record<string, unknown>,
@@ -36,7 +36,7 @@ export function extractRoles(
 ): string[] | undefined {
   let cur: unknown = claims;
   for (const part of claimPath.split(".")) {
-    if (cur && typeof cur === "object" && part in (cur as object)) {
+    if (cur && typeof cur === "object" && part in cur) {
       cur = (cur as Record<string, unknown>)[part];
     } else {
       return undefined;
@@ -47,8 +47,8 @@ export function extractRoles(
 }
 
 /**
- * Calcule les ajouts/retraits d'appartenance, limités aux groupes « managés »
- * (cibles d'au moins un mapping). Les groupes non managés ne sont jamais touchés.
+ * Computes membership add/remove deltas, limited to "managed" groups
+ * (targets of at least one mapping). Non-managed groups are never touched.
  */
 export function computeMembershipChanges(input: {
   managedGroupIds: number[];
@@ -116,10 +116,9 @@ export async function syncUserGroupsFromRoles(
 }
 
 /**
- * Synchronise les groupes d'un utilisateur à partir des rôles présents dans les
- * ID tokens OIDC stockés sur ses comptes. Appelée à chaque login (session.create.after).
- * Les tokens expirés sont ignorés pour éviter de réappliquer des rôles périmés lors
- * d'un login non-OIDC (ex. credentials).
+ * Syncs a user's groups from the roles present in the OIDC ID tokens stored on
+ * their accounts. Called on every login (session.create.after). Expired tokens are
+ * skipped to avoid re-applying stale roles during a non-OIDC login (e.g. credentials).
  */
 export async function syncRolesForUserSession(
   database: SyncDb,
@@ -146,7 +145,7 @@ export async function syncRolesForUserSession(
     if (!payload) continue;
 
     const exp = typeof payload.exp === "number" ? payload.exp : 0;
-    if (exp > 0 && exp * 1000 < Date.now()) continue; // token périmé → ignore
+    if (exp > 0 && exp * 1000 < Date.now()) continue; // expired token → ignore
 
     const providerRows = await database
       .select({ rolesClaim: oauthProviders.rolesClaim })
