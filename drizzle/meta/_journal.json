@@ -162,6 +162,13 @@
       "when": 1776200000000,
       "tag": "0022_nullable_provider_subject",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "6",
+      "when": 1748736000000,
+      "tag": "0023_oauth_role_mappings",
+      "breakpoints": true
     }
   ]
 }
