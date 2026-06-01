@@ -1,6 +1,7 @@
 import type { BaseSQLiteDatabase } from "drizzle-orm/sqlite-core";
 import { and, eq, inArray } from "drizzle-orm";
-import { groupMembers, oauthRoleMappings } from "../db/schema";
+import { accounts, groupMembers, oauthProviders, oauthRoleMappings } from "../db/schema";
+import { decryptSecret, isEncryptedSecret } from "../secret";
 
 /** Accepte aussi bien le driver bun-sqlite (prod) que better-sqlite3 (tests) — tous deux synchrones. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -112,4 +113,50 @@ export async function syncUserGroupsFromRoles(
   }
 
   return { skipped: false, added: toAdd, removed: toRemove };
+}
+
+/**
+ * Synchronise les groupes d'un utilisateur à partir des rôles présents dans les
+ * ID tokens OIDC stockés sur ses comptes. Appelée à chaque login (session.create.after).
+ * Les tokens expirés sont ignorés pour éviter de réappliquer des rôles périmés lors
+ * d'un login non-OIDC (ex. credentials).
+ */
+export async function syncRolesForUserSession(
+  database: SyncDb,
+  userId: number
+): Promise<void> {
+  const accountRows = await database
+    .select({ providerId: accounts.providerId, idToken: accounts.idToken })
+    .from(accounts)
+    .where(eq(accounts.userId, userId));
+
+  for (const acc of accountRows) {
+    if (acc.providerId === "credential" || !acc.idToken) continue;
+
+    let raw = acc.idToken;
+    if (isEncryptedSecret(raw)) {
+      try {
+        raw = decryptSecret(raw);
+      } catch {
+        continue;
+      }
+    }
+
+    const payload = decodeJwtPayload(raw);
+    if (!payload) continue;
+
+    const exp = typeof payload.exp === "number" ? payload.exp : 0;
+    if (exp > 0 && exp * 1000 < Date.now()) continue; // token périmé → ignore
+
+    const providerRows = await database
+      .select({ rolesClaim: oauthProviders.rolesClaim })
+      .from(oauthProviders)
+      .where(eq(oauthProviders.id, acc.providerId));
+    const provider = providerRows[0];
+    if (!provider) continue;
+
+    const claimPath = provider.rolesClaim ?? DEFAULT_ROLES_CLAIM;
+    const roles = extractRoles(payload, claimPath);
+    await syncUserGroupsFromRoles(database, userId, acc.providerId, roles);
+  }
 }

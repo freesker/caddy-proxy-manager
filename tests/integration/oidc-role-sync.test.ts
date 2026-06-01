@@ -1,9 +1,11 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { createTestDb, type TestDb } from "../helpers/db";
-import { groupMembers, oauthRoleMappings, groups, users, oauthProviders } from "@/src/lib/db/schema";
+import { groupMembers, oauthRoleMappings, groups, users, oauthProviders, accounts } from "@/src/lib/db/schema";
 import { eq } from "drizzle-orm";
 import { encryptSecret } from "@/src/lib/secret";
 import { syncUserGroupsFromRoles } from "@/src/lib/services/oidc-role-sync";
+import { randomUUID } from "node:crypto";
+import { syncRolesForUserSession } from "@/src/lib/services/oidc-role-sync";
 
 let db: TestDb;
 const PROVIDER = "prov-1";
@@ -78,5 +80,65 @@ describe("syncUserGroupsFromRoles", () => {
     await addMapping("ops", 2, "other"); // provider "other"
     await syncUserGroupsFromRoles(db, 10, PROVIDER, ["ops"]);
     expect(await memberGroupIds(10)).toEqual([1]); // group 2 (other provider) untouched
+  });
+});
+
+function makeIdToken(payload: Record<string, unknown>): string {
+  const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64url");
+  return `${b64({ alg: "RS256" })}.${b64(payload)}.sig`;
+}
+
+describe("syncRolesForUserSession", () => {
+  it("applies roles from the stored ID token for OAuth accounts", async () => {
+    const providerId = randomUUID();
+    const now = new Date().toISOString();
+    await db.insert(oauthProviders).values({
+      id: providerId, name: "Keycloak", type: "oidc",
+      clientId: encryptSecret("cid"), clientSecret: encryptSecret("cs"),
+      scopes: "openid", rolesClaim: null,
+      autoLink: false, enabled: true, source: "ui", createdAt: now, updatedAt: now,
+    });
+    await db.insert(oauthRoleMappings).values({ providerId, role: "ops", groupId: 1, createdAt: now });
+    await db.insert(oauthRoleMappings).values({ providerId, role: "admin", groupId: 2, createdAt: now });
+
+    const idToken = makeIdToken({
+      sub: "kc-user-1",
+      exp: Math.floor(Date.now() / 1000) + 3600,
+      realm_access: { roles: ["ops"] },
+    });
+    await db.insert(accounts).values({
+      userId: 10, accountId: "kc-user-1", providerId,
+      idToken: encryptSecret(idToken), createdAt: now, updatedAt: now,
+    });
+
+    await syncRolesForUserSession(db, 10);
+    expect(await memberGroupIds(10)).toEqual([1]);
+  });
+
+  it("ignores credential accounts and skips expired ID tokens", async () => {
+    const providerId = randomUUID();
+    const now = new Date().toISOString();
+    await db.insert(oauthProviders).values({
+      id: providerId, name: "KC", type: "oidc",
+      clientId: encryptSecret("cid"), clientSecret: encryptSecret("cs"),
+      scopes: "openid", rolesClaim: null,
+      autoLink: false, enabled: true, source: "ui", createdAt: now, updatedAt: now,
+    });
+    await db.insert(oauthRoleMappings).values({ providerId, role: "ops", groupId: 1, createdAt: now });
+    await db.insert(accounts).values({
+      userId: 10, accountId: "10", providerId: "credential",
+      password: "hash", createdAt: now, updatedAt: now,
+    });
+    const expired = makeIdToken({
+      sub: "kc-user-1", exp: Math.floor(Date.now() / 1000) - 10,
+      realm_access: { roles: ["ops"] },
+    });
+    await db.insert(accounts).values({
+      userId: 10, accountId: "kc-user-1", providerId,
+      idToken: encryptSecret(expired), createdAt: now, updatedAt: now,
+    });
+
+    await syncRolesForUserSession(db, 10);
+    expect(await memberGroupIds(10)).toEqual([]);
   });
 });
