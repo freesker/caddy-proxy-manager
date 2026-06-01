@@ -55,6 +55,7 @@ function loadProvidersSync(): GenericOAuthConfig[] {
       tokenUrl: row.tokenUrl,
       userinfoUrl: row.userinfoUrl,
       scopes: row.scopes,
+      rolesClaim: row.rolesClaim,
       autoLink: row.autoLink,
       enabled: row.enabled,
       source: row.source,
@@ -163,6 +164,15 @@ function createAuth(): any {
               });
             } catch {
               // Don't break auth flow if audit logging fails
+            }
+            try {
+              const { syncRolesForUserSession } = await import("./services/oidc-role-sync");
+              const database = (await import("./db")).default;
+              const uid =
+                typeof session.userId === "string" ? Number(session.userId) : session.userId;
+              await syncRolesForUserSession(database, uid);
+            } catch (e) {
+              console.warn("[auth-server] role→group sync failed", e);
             }
           },
         },

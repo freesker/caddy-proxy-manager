@@ -3,6 +3,8 @@ import { getGeneralSettings, getAuthentikSettings, getMetricsSettings, getLoggin
 import { getInstanceMode, getSlaveLastSync, getSlaveMasterToken, isInstanceModeFromEnv, isSyncTokenFromEnv, getEnvSlaveInstances } from "@/src/lib/instance-sync";
 import { listInstances } from "@/src/lib/models/instances";
 import { listOAuthProviders } from "@/src/lib/models/oauth-providers";
+import { listRoleMappings } from "@/src/lib/models/oauth-role-mappings";
+import { listGroups } from "@/src/lib/models/groups";
 import { DNS_PROVIDERS } from "@/src/lib/dns-providers";
 import { config } from "@/src/lib/config";
 import { requireAdmin } from "@/src/lib/auth";
@@ -14,7 +16,7 @@ export default async function SettingsPage() {
   const modeFromEnv = isInstanceModeFromEnv();
   const tokenFromEnv = isSyncTokenFromEnv();
 
-  const [general, dnsProvider, authentik, metrics, logging, dns, upstreamDnsResolution, instanceMode, globalGeoBlock, oauthProviders] = await Promise.all([
+  const [general, dnsProvider, authentik, metrics, logging, dns, upstreamDnsResolution, instanceMode, globalGeoBlock, oauthProviders, roleMappings, allGroups] = await Promise.all([
     getGeneralSettings(),
     getDnsProviderSettings(),
     getAuthentikSettings(),
@@ -25,6 +27,8 @@ export default async function SettingsPage() {
     getInstanceMode(),
     getGeoBlockSettings(),
     listOAuthProviders(),
+    listRoleMappings(),
+    listGroups(),
   ]);
 
   const [overrideGeneral, overrideDnsProvider, overrideAuthentik, overrideMetrics, overrideLogging, overrideDns, overrideUpstreamDnsResolution] =
@@ -47,6 +51,9 @@ export default async function SettingsPage() {
   const instances = instanceMode === "master" ? await listInstances() : [];
   const envInstances = instanceMode === "master" ? getEnvSlaveInstances() : [];
 
+  const roleMappingProviders = oauthProviders.map((p) => ({ id: p.id, name: p.name }));
+  const roleMappingGroups = allGroups.map((g) => ({ id: g.id, name: g.name }));
+
   return (
     <SettingsClient
       general={general}
@@ -59,6 +66,9 @@ export default async function SettingsPage() {
       upstreamDnsResolution={upstreamDnsResolution}
       globalGeoBlock={globalGeoBlock}
       oauthProviders={oauthProviders}
+      roleMappings={roleMappings}
+      roleMappingProviders={roleMappingProviders}
+      roleMappingGroups={roleMappingGroups}
       baseUrl={config.baseUrl}
       instanceSync={{
         mode: instanceMode,

@@ -176,6 +176,7 @@ export const config = {
     authorizationUrl: process.env.OAUTH_AUTHORIZATION_URL ?? null,
     tokenUrl: process.env.OAUTH_TOKEN_URL ?? null,
     userinfoUrl: process.env.OAUTH_USERINFO_URL ?? null,
+    rolesClaim: process.env.OAUTH_ROLES_CLAIM || undefined,
     allowAutoLinking: process.env.OAUTH_ALLOW_AUTO_LINKING === "true",
   },
   forwardAuthInternalUrl: process.env.FORWARD_AUTH_INTERNAL_URL ?? null,

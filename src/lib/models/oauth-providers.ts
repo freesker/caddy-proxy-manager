@@ -15,6 +15,7 @@ export type OAuthProvider = {
   tokenUrl: string | null;
   userinfoUrl: string | null;
   scopes: string;
+  rolesClaim: string | null;
   autoLink: boolean;
   enabled: boolean;
   source: string;
@@ -36,6 +37,7 @@ function parseDbProvider(row: DbProvider): OAuthProvider {
     tokenUrl: row.tokenUrl,
     userinfoUrl: row.userinfoUrl,
     scopes: row.scopes,
+    rolesClaim: row.rolesClaim,
     autoLink: row.autoLink,
     enabled: row.enabled,
     source: row.source,
@@ -54,6 +56,7 @@ export async function createOAuthProvider(data: {
   tokenUrl?: string | null;
   userinfoUrl?: string | null;
   scopes?: string;
+  rolesClaim?: string | null;
   autoLink?: boolean;
   enabled?: boolean;
   source?: string;
@@ -74,6 +77,7 @@ export async function createOAuthProvider(data: {
       tokenUrl: data.tokenUrl ?? null,
       userinfoUrl: data.userinfoUrl ?? null,
       scopes: data.scopes ?? "openid email profile",
+      rolesClaim: data.rolesClaim ?? null,
       autoLink: data.autoLink ?? false,
       enabled: data.enabled ?? true,
       source: data.source ?? "ui",
@@ -126,6 +130,7 @@ export async function updateOAuthProvider(
     tokenUrl: string | null;
     userinfoUrl: string | null;
     scopes: string;
+    rolesClaim: string | null;
     autoLink: boolean;
     enabled: boolean;
   }>
@@ -143,6 +148,7 @@ export async function updateOAuthProvider(
   if (data.tokenUrl !== undefined) updates.tokenUrl = data.tokenUrl;
   if (data.userinfoUrl !== undefined) updates.userinfoUrl = data.userinfoUrl;
   if (data.scopes !== undefined) updates.scopes = data.scopes;
+  if (data.rolesClaim !== undefined) updates.rolesClaim = data.rolesClaim;
   if (data.autoLink !== undefined) updates.autoLink = data.autoLink;
   if (data.enabled !== undefined) updates.enabled = data.enabled;
 
@@ -168,6 +174,8 @@ export async function deleteOAuthProvider(id: string): Promise<void> {
     throw new Error("Cannot delete an environment-sourced OAuth provider");
   }
 
+  const { deleteMappingsForProvider } = await import("./oauth-role-mappings");
+  await deleteMappingsForProvider(db, id);
   await db.delete(oauthProviders).where(eq(oauthProviders.id, id));
 }
 

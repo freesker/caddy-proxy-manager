@@ -93,6 +93,7 @@ export const oauthProviders = sqliteTable(
     authorizationUrl: text("authorizationUrl"),
     tokenUrl: text("tokenUrl"),
     userinfoUrl: text("userinfoUrl"),
+    rolesClaim: text("rolesClaim"),
     scopes: text("scopes").notNull().default("openid email profile"),
     autoLink: integer("autoLink", { mode: "boolean" }).notNull().default(false),
     enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
@@ -397,6 +398,30 @@ export const groupMembers = sqliteTable(
   (table) => ({
     memberUnique: uniqueIndex("group_members_unique").on(table.groupId, table.userId),
     userIdx: index("group_members_user_idx").on(table.userId)
+  })
+);
+
+export const oauthRoleMappings = sqliteTable(
+  "oauth_role_mappings",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    providerId: text("providerId")
+      .references(() => oauthProviders.id, { onDelete: "cascade" })
+      .notNull(),
+    role: text("role").notNull(),
+    groupId: integer("groupId")
+      .references(() => groups.id, { onDelete: "cascade" })
+      .notNull(),
+    createdAt: text("createdAt").notNull()
+  },
+  (table) => ({
+    mappingUnique: uniqueIndex("oauth_role_mappings_unique").on(
+      table.providerId,
+      table.role,
+      table.groupId
+    ),
+    providerIdx: index("oauth_role_mappings_provider_idx").on(table.providerId),
+    groupIdx: index("oauth_role_mappings_group_idx").on(table.groupId)
   })
 );
 

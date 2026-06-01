@@ -37,6 +37,7 @@ import type {
 import type { DnsProviderDefinition } from "@/src/lib/dns-providers";
 import { GeoBlockFields } from "@/components/proxy-hosts/GeoBlockFields";
 import OAuthProvidersSection from "./OAuthProvidersSection";
+import OAuthRoleMappingsSection from "./OAuthRoleMappingsSection";
 import type { OAuthProvider } from "@/src/lib/models/oauth-providers";
 import {
   updateDnsProviderSettingsAction,
@@ -377,6 +378,9 @@ type Props = {
   upstreamDnsResolution: UpstreamDnsResolutionSettings | null;
   globalGeoBlock?: GeoBlockSettings | null;
   oauthProviders: OAuthProvider[];
+  roleMappings: { id: number; providerId: string; role: string; groupId: number }[];
+  roleMappingProviders: { id: string; name: string }[];
+  roleMappingGroups: { id: number; name: string }[];
   baseUrl: string;
   instanceSync: {
     mode: "standalone" | "master" | "slave";
@@ -426,6 +430,9 @@ export default function SettingsClient({
   upstreamDnsResolution,
   globalGeoBlock,
   oauthProviders,
+  roleMappings,
+  roleMappingProviders,
+  roleMappingGroups,
   baseUrl,
   instanceSync,
 }: Props) {
@@ -574,10 +581,22 @@ export default function SettingsClient({
                 />
               )}
               {active === "oauth" && (
-                <OAuthSection
-                  oauthProviders={oauthProviders}
-                  baseUrl={baseUrl}
-                />
+                <>
+                  <OAuthSection
+                    oauthProviders={oauthProviders}
+                    baseUrl={baseUrl}
+                  />
+                  <FormCard title="Keycloak Role Mappings">
+                    <p className="text-xs text-muted-foreground mb-4">
+                      Map Keycloak roles to CPM groups for forward-auth access.
+                    </p>
+                    <OAuthRoleMappingsSection
+                      initialMappings={roleMappings}
+                      providers={roleMappingProviders}
+                      groups={roleMappingGroups}
+                    />
+                  </FormCard>
+                </>
               )}
               {active === "metrics" && (
                 <MetricsSection

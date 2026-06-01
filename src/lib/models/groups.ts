@@ -168,6 +168,8 @@ export async function deleteGroup(id: number, actorUserId: number): Promise<void
   });
   if (!existing) throw new Error("Group not found");
 
+  const { deleteMappingsForGroup } = await import("./oauth-role-mappings");
+  await deleteMappingsForGroup(db, id);
   await db.delete(groups).where(eq(groups.id, id));
 
   logAuditEvent({

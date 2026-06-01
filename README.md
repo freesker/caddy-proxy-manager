@@ -344,6 +344,33 @@ The `BASE_URL` environment variable must match exactly where users access your d
 
 OAuth login appears on the login page alongside credentials. Users can link OAuth to existing accounts from the Profile page.
 
+### Restricting host access by Keycloak role
+
+CPM can drive Forward Auth host access from Keycloak roles by syncing roles to CPM groups at login.
+
+1. **Expose roles in the ID token (Keycloak).** On your CPM client, add a protocol mapper:
+   - Type **User Realm Role** (or **User Client Role** for client roles)
+   - **Multivalued**: ON
+   - **Token Claim Name**: `realm_access.roles`
+   - **Add to ID token**: ON, **Add to userinfo**: ON
+
+   Assign realm/client roles to your users.
+
+2. **(Optional) Set the roles claim path in CPM.** In *Settings → OAuth Providers*, edit the
+   provider and set **Roles claim** if it differs from the default `realm_access.roles`
+   (e.g. `resource_access.<client>.roles`).
+
+3. **Create the mappings.** In *Settings → Keycloak Role Mappings*, map each Keycloak role to a CPM
+   group. Mapped groups are recalculated from the user's roles at every login (membership is added
+   **and** removed) — do not edit their membership by hand (they are locked on the Groups page).
+
+4. **Grant group access to hosts.** On a Forward-Auth-protected host, grant access to the mapped
+   group(s). Users with the matching Keycloak role get access; users who lose the role lose access
+   at their next login.
+
+> If the roles claim is absent from the ID token (mapper not configured), CPM skips the sync and
+> logs a warning rather than removing everyone from mapped groups.
+
 ---
 
 ## Forward Auth Portal
