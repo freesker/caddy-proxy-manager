@@ -894,6 +894,51 @@ export async function deleteOAuthProviderAction(id: string) {
   revalidatePath("/settings");
 }
 
+export async function getRoleMappingsAction() {
+  await requireAdmin();
+  const { listRoleMappings } = await import("@/src/lib/models/oauth-role-mappings");
+  return listRoleMappings();
+}
+
+export async function createRoleMappingAction(data: {
+  providerId: string;
+  role: string;
+  groupId: number;
+}) {
+  const session = await requireAdmin();
+  const { createRoleMapping } = await import("@/src/lib/models/oauth-role-mappings");
+  const mapping = await createRoleMapping(data);
+  const { createAuditEvent } = await import("@/src/lib/models/audit");
+  await createAuditEvent({
+    userId: Number(session.user.id),
+    action: "oauth_role_mapping_created",
+    entityType: "oauth_role_mapping",
+    entityId: mapping.id,
+    summary: `Mapped role "${data.role}" to group ${data.groupId}`,
+    data: JSON.stringify(data),
+  });
+  revalidatePath("/settings");
+  revalidatePath("/groups");
+  return mapping;
+}
+
+export async function deleteRoleMappingAction(id: number) {
+  const session = await requireAdmin();
+  const { deleteRoleMapping } = await import("@/src/lib/models/oauth-role-mappings");
+  await deleteRoleMapping(id);
+  const { createAuditEvent } = await import("@/src/lib/models/audit");
+  await createAuditEvent({
+    userId: Number(session.user.id),
+    action: "oauth_role_mapping_deleted",
+    entityType: "oauth_role_mapping",
+    entityId: id,
+    summary: `Deleted role mapping ${id}`,
+    data: JSON.stringify({ id }),
+  });
+  revalidatePath("/settings");
+  revalidatePath("/groups");
+}
+
 export async function suppressWafRuleForHostAction(ruleId: number, hostname: string): Promise<ActionResult> {
   try {
     const session = await requireAdmin();
