@@ -168,6 +168,8 @@ export async function deleteOAuthProvider(id: string): Promise<void> {
     throw new Error("Cannot delete an environment-sourced OAuth provider");
   }
 
+  const { deleteMappingsForProvider } = await import("./oauth-role-mappings");
+  await deleteMappingsForProvider(db, id);
   await db.delete(oauthProviders).where(eq(oauthProviders.id, id));
 }
 
