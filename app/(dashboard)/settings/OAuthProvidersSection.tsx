@@ -39,6 +39,7 @@ type FormData = {
   tokenUrl: string;
   userinfoUrl: string;
   scopes: string;
+  rolesClaim: string;
   autoLink: boolean;
 };
 
@@ -52,6 +53,7 @@ const emptyForm: FormData = {
   tokenUrl: "",
   userinfoUrl: "",
   scopes: "openid email profile",
+  rolesClaim: "",
   autoLink: false,
 };
 
@@ -89,6 +91,7 @@ export default function OAuthProvidersSection({ initialProviders, baseUrl }: OAu
       tokenUrl: provider.tokenUrl ?? "",
       userinfoUrl: provider.userinfoUrl ?? "",
       scopes: provider.scopes,
+      rolesClaim: provider.rolesClaim ?? "",
       autoLink: provider.autoLink,
     });
     setError(null);
@@ -116,6 +119,7 @@ export default function OAuthProvidersSection({ initialProviders, baseUrl }: OAu
           tokenUrl: form.tokenUrl.trim() || null,
           userinfoUrl: form.userinfoUrl.trim() || null,
           scopes: form.scopes.trim() || "openid email profile",
+          rolesClaim: form.rolesClaim.trim() || null,
           autoLink: form.autoLink,
         });
         if (updated) {
@@ -134,6 +138,7 @@ export default function OAuthProvidersSection({ initialProviders, baseUrl }: OAu
           tokenUrl: form.tokenUrl.trim() || undefined,
           userinfoUrl: form.userinfoUrl.trim() || undefined,
           scopes: form.scopes.trim() || undefined,
+          rolesClaim: form.rolesClaim.trim() || undefined,
           autoLink: form.autoLink,
         });
         setProviders((prev) => [...prev, created]);
@@ -412,6 +417,20 @@ export default function OAuthProvidersSection({ initialProviders, baseUrl }: OAu
                 placeholder="openid email profile"
                 className="h-8 text-sm font-mono"
               />
+            </div>
+
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="oauth-roles-claim">Roles claim (RBAC)</Label>
+              <Input
+                id="oauth-roles-claim"
+                value={form.rolesClaim}
+                onChange={(e) => updateField("rolesClaim", e.target.value)}
+                placeholder="realm_access.roles"
+                className="h-8 text-sm font-mono"
+              />
+              <p className="text-xs text-muted-foreground">
+                Chemin du claim contenant les rôles dans l&apos;ID token Keycloak (laisser vide = realm_access.roles).
+              </p>
             </div>
 
             <div className="flex items-center gap-2 pt-1">

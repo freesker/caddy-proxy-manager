@@ -818,6 +818,7 @@ export async function createOAuthProviderAction(data: {
   authorizationUrl?: string;
   tokenUrl?: string;
   userinfoUrl?: string;
+  rolesClaim?: string;
   scopes?: string;
   autoLink?: boolean;
 }) {
@@ -850,6 +851,7 @@ export async function updateOAuthProviderAction(
     authorizationUrl: string | null;
     tokenUrl: string | null;
     userinfoUrl: string | null;
+    rolesClaim: string | null;
     scopes: string;
     autoLink: boolean;
     enabled: boolean;

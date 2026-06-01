@@ -55,6 +55,7 @@ function loadProvidersSync(): GenericOAuthConfig[] {
       tokenUrl: row.tokenUrl,
       userinfoUrl: row.userinfoUrl,
       scopes: row.scopes,
+      rolesClaim: row.rolesClaim,
       autoLink: row.autoLink,
       enabled: row.enabled,
       source: row.source,

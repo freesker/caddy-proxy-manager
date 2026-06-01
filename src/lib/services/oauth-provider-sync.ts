@@ -30,6 +30,7 @@ export async function syncEnvOAuthProviders(): Promise<void> {
     authorizationUrl: config.oauth.authorizationUrl ?? null,
     tokenUrl: config.oauth.tokenUrl ?? null,
     userinfoUrl: config.oauth.userinfoUrl ?? null,
+    rolesClaim: config.oauth.rolesClaim ?? null,
     autoLink: config.oauth.allowAutoLinking,
   };
 
