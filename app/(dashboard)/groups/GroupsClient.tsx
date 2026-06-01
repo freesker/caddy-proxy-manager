@@ -42,10 +42,12 @@ type UserEntry = {
 type Props = {
   groups: Group[];
   users: UserEntry[];
+  managedGroupIds: number[];
 };
 
-export default function GroupsClient({ groups, users }: Props) {
+export default function GroupsClient({ groups, users, managedGroupIds }: Props) {
   const router = useRouter();
+  const managed = new Set(managedGroupIds);
   const [showCreate, setShowCreate] = useState(false);
   const [addMemberGroupId, setAddMemberGroupId] = useState<number | null>(null);
 
@@ -112,12 +114,20 @@ export default function GroupsClient({ groups, users }: Props) {
       <div className="grid gap-4">
         {groups.map((group) => {
           const available = getAvailableUsers(group);
+          const isManaged = managed.has(group.id);
           return (
             <Card key={group.id} className="border-l-4 border-l-blue-500">
               <CardContent className="pt-4">
                 <div className="flex items-center justify-between mb-3">
                   <div>
-                    <h3 className="font-semibold text-base">{group.name}</h3>
+                    <div className="flex items-center gap-2">
+                      <h3 className="font-semibold text-base">{group.name}</h3>
+                      {isManaged && (
+                        <span className="text-xs rounded-full border border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-400 px-2 py-0.5">
+                          Géré par Keycloak
+                        </span>
+                      )}
+                    </div>
                     {group.description && (
                       <p className="text-sm text-muted-foreground">{group.description}</p>
                     )}
@@ -130,10 +140,11 @@ export default function GroupsClient({ groups, users }: Props) {
                       variant="ghost"
                       size="icon"
                       className="h-7 w-7"
+                      disabled={isManaged}
                       onClick={() =>
                         setAddMemberGroupId(addMemberGroupId === group.id ? null : group.id)
                       }
-                      title="Add member"
+                      title={isManaged ? "Appartenance pilotée par les rôles Keycloak" : "Add member"}
                     >
                       <UserPlus className="h-4 w-4" />
                     </Button>
@@ -222,11 +233,12 @@ export default function GroupsClient({ groups, users }: Props) {
                             variant="ghost"
                             size="icon"
                             className="h-6 w-6 text-muted-foreground hover:text-destructive"
+                            disabled={isManaged}
                             onClick={async () => {
                               await removeGroupMemberAction(group.id, member.userId);
                               router.refresh();
                             }}
-                            title="Remove member"
+                            title={isManaged ? "Appartenance pilotée par les rôles Keycloak" : "Remove member"}
                           >
                             <UserMinus className="h-3 w-3" />
                           </Button>
