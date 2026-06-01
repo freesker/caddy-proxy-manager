@@ -8,7 +8,7 @@
 
 > **Note de réconciliation avec le spec :** le spec décrivait en primaire un override `getUserInfo` + stash mémoire, avec « persister les rôles sur `accounts` » en fallback. Ce plan réalise le **fallback** (lecture de l'ID token stocké dans `session.create.after`), plus robuste et sans dépendre de l'API interne de better-auth. La config Keycloak requise est identique (mapper avec *Add to ID token: ON*).
 
-> **Contrainte projet importante :** `PRAGMA foreign_keys` n'est **pas** activé (ni prod ni tests). Les `onDelete: cascade` du schéma ne suppriment rien à l'exécution. Toute suppression en cascade doit donc être faite **manuellement** dans le code (cf. Task 4).
+> **Contrainte projet importante (FK) :** le projet ne définit aucun `PRAGMA foreign_keys`. En **test** (better-sqlite3) les FK **sont appliquées** → les tests doivent seeder les lignes parentes (users/groups/providers) avant d'insérer mappings/membres/comptes. En **prod** (bun:sqlite) les cascades ne sont **pas garanties** → le nettoyage des mappings à la suppression d'un provider/groupe est fait **manuellement** dans le code (cf. Task 4).
 
 **Tech Stack :** Next.js (App Router) · TypeScript · Drizzle ORM (SQLite, bun-sqlite en prod / better-sqlite3 en test) · better-auth `genericOAuth` · Vitest · shadcn/ui.
 
@@ -109,7 +109,7 @@ export const oauthRoleMappings = sqliteTable(
 );
 ```
 
-> `onDelete: "cascade"` est conservé pour cohérence avec le reste du schéma, mais ne supprime rien à l'exécution (FK off) — le nettoyage réel est fait en Task 4.
+> `onDelete: "cascade"` est conservé pour cohérence avec le reste du schéma ; les cascades ne sont pas garanties en prod (bun:sqlite, FK non configurées) — le nettoyage réel est fait en Task 4.
 
 - [ ] **Step 3 : Générer la migration**
 
@@ -332,15 +332,28 @@ Créer `tests/integration/oidc-role-sync.test.ts` :
 ```ts
 import { describe, it, expect, beforeEach } from "vitest";
 import { createTestDb, type TestDb } from "../helpers/db";
-import { groupMembers, oauthRoleMappings } from "@/src/lib/db/schema";
+import { groupMembers, oauthRoleMappings, groups, users, oauthProviders } from "@/src/lib/db/schema";
 import { eq } from "drizzle-orm";
+import { encryptSecret } from "@/src/lib/secret";
 import { syncUserGroupsFromRoles } from "@/src/lib/services/oidc-role-sync";
 
 let db: TestDb;
 const PROVIDER = "prov-1";
 
-beforeEach(() => {
+// La base de test applique les FK → seeder les lignes parentes (users, groups, providers).
+beforeEach(async () => {
   db = createTestDb();
+  const now = new Date().toISOString();
+  await db.insert(users).values({ id: 10, email: "u10@example.com", createdAt: now, updatedAt: now });
+  await db.insert(groups).values([
+    { id: 1, name: "g1", createdAt: now, updatedAt: now },
+    { id: 2, name: "g2", createdAt: now, updatedAt: now },
+    { id: 99, name: "g99", createdAt: now, updatedAt: now },
+  ]);
+  await db.insert(oauthProviders).values([
+    { id: PROVIDER, name: "P1", clientId: encryptSecret("c"), clientSecret: encryptSecret("s"), scopes: "openid", createdAt: now, updatedAt: now },
+    { id: "other", name: "Other", clientId: encryptSecret("c"), clientSecret: encryptSecret("s"), scopes: "openid", createdAt: now, updatedAt: now },
+  ]);
 });
 
 async function memberGroupIds(userId: number): Promise<number[]> {
@@ -503,13 +516,24 @@ Créer `tests/integration/oauth-role-mappings.test.ts` :
 ```ts
 import { describe, it, expect, beforeEach } from "vitest";
 import { createTestDb, type TestDb } from "../helpers/db";
-import { oauthRoleMappings } from "@/src/lib/db/schema";
+import { oauthRoleMappings, groups, oauthProviders } from "@/src/lib/db/schema";
+import { encryptSecret } from "@/src/lib/secret";
 import { eq } from "drizzle-orm";
 
 let db: TestDb;
 
-beforeEach(() => {
+// La base de test applique les FK → seeder les providers et groupes parents.
+beforeEach(async () => {
   db = createTestDb();
+  const now = new Date().toISOString();
+  await db.insert(groups).values([
+    { id: 1, name: "g1", createdAt: now, updatedAt: now },
+    { id: 2, name: "g2", createdAt: now, updatedAt: now },
+  ]);
+  await db.insert(oauthProviders).values([
+    { id: "p1", name: "P1", clientId: encryptSecret("c"), clientSecret: encryptSecret("s"), scopes: "openid", createdAt: now, updatedAt: now },
+    { id: "p2", name: "P2", clientId: encryptSecret("c"), clientSecret: encryptSecret("s"), scopes: "openid", createdAt: now, updatedAt: now },
+  ]);
 });
 
 async function insertMapping(providerId: string, role: string, groupId: number) {
@@ -805,11 +829,9 @@ git commit -m "feat(oauth): add per-provider rolesClaim (UI, model, env)"
 
 - [ ] **Step 1 : Écrire le test d'intégration de la synchro de session**
 
-Ajouter à `tests/integration/oidc-role-sync.test.ts` (nouveaux imports + nouveau bloc `describe`) :
+Ajouter à `tests/integration/oidc-role-sync.test.ts`. D'abord compléter les imports en tête : ajouter `accounts` à l'import existant depuis `@/src/lib/db/schema` (qui contient déjà `oauthProviders`, `oauthRoleMappings`, `groups`, `users`) ; `encryptSecret` est déjà importé. Ajouter aussi les deux imports ci-dessous, puis le bloc `describe` (le `beforeEach` du fichier seede déjà `users(10)` et `groups(1,2,99)`, donc les insertions FK sont satisfaites) :
 
 ```ts
-import { accounts, oauthProviders } from "@/src/lib/db/schema";
-import { encryptSecret } from "@/src/lib/secret";
 import { randomUUID } from "node:crypto";
 import { syncRolesForUserSession } from "@/src/lib/services/oidc-role-sync";
 
