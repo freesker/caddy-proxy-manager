@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<!--
+  Envoie les logs du serveur ClickHouse sur stdout/stderr (gérés par Docker)
+  et désactive le logging fichier, ce qui supprime le chemin de rotation
+  responsable des "File access error" sur clickhouse-server.err.log.
+  Ces logs sont purement internes au moteur : l'application ne les utilise pas.
+-->
+<clickhouse>
+    <logger>
+        <level>warning</level>
+        <console>true</console>
+        <log remove="remove"/>
+        <errorlog remove="remove"/>
+    </logger>
+</clickhouse>
