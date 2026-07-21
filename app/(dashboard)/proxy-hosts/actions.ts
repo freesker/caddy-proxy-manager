@@ -436,12 +436,15 @@ function parseMtlsConfig(formData: FormData): MtlsConfig | null {
   if (!enabled) return null;
   const certIds = formData.getAll("mtlsCertId").map(Number).filter(n => Number.isFinite(n) && n > 0);
   const roleIds = formData.getAll("mtlsRoleId").map(Number).filter(n => Number.isFinite(n) && n > 0);
+  // Trust entire CAs (for imported CAs with no tracked client certificates).
+  const caIds = formData.getAll("mtlsCaId").map(Number).filter(n => Number.isFinite(n) && n > 0);
   const protectedPaths = parseCsv(formData.get("mtlsProtectedPaths"));
   const excludedPaths = parseCsv(formData.get("mtlsExcludedPaths"));
   return {
     enabled,
     trusted_client_cert_ids: certIds,
     trusted_role_ids: roleIds,
+    ca_certificate_ids: caIds,
     protected_paths: protectedPaths.length > 0 ? protectedPaths : null,
     excluded_paths: excludedPaths.length > 0 ? excludedPaths : null,
   };

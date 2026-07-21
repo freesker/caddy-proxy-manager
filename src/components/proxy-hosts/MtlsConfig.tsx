@@ -31,6 +31,8 @@ export function MtlsFields({ value, caCertificates, issuedClientCerts = [], prox
   const [enabled, setEnabled] = useState(value?.enabled ?? false);
   const [selectedCertIds, setSelectedCertIds] = useState<number[]>(value?.trusted_client_cert_ids ?? []);
   const [selectedRoleIds, setSelectedRoleIds] = useState<number[]>(value?.trusted_role_ids ?? []);
+  // Trusted whole CAs (for imported CAs with no tracked client certificates).
+  const [selectedCaIds, setSelectedCaIds] = useState<number[]>(value?.ca_certificate_ids ?? []);
 
   const [rules, setRules] = useState<MtlsAccessRule[]>([]);
   const [rulesLoaded, setRulesLoaded] = useState(false);
@@ -67,6 +69,10 @@ export function MtlsFields({ value, caCertificates, issuedClientCerts = [], prox
     setSelectedRoleIds(prev => prev.includes(roleId) ? prev.filter(i => i !== roleId) : [...prev, roleId]);
   }
 
+  function toggleCa(caId: number) {
+    setSelectedCaIds(prev => prev.includes(caId) ? prev.filter(i => i !== caId) : [...prev, caId]);
+  }
+
   function toggleAllFromCA(caId: number) {
     const caCerts = certsByCA.get(caId) ?? [];
     const caIds = caCerts.map(c => c.id);
@@ -81,7 +87,7 @@ export function MtlsFields({ value, caCertificates, issuedClientCerts = [], prox
     } catch { /* silent */ }
   }
 
-  const hasTrust = selectedCertIds.length > 0 || selectedRoleIds.length > 0;
+  const hasTrust = selectedCertIds.length > 0 || selectedRoleIds.length > 0 || selectedCaIds.length > 0;
 
   return (
     <div className="rounded-lg border border-amber-500/60 bg-amber-500/5 p-4">
@@ -92,6 +98,9 @@ export function MtlsFields({ value, caCertificates, issuedClientCerts = [], prox
       ))}
       {enabled && selectedRoleIds.map(id => (
         <input key={`r${id}`} type="hidden" name="mtlsRoleId" value={String(id)} />
+      ))}
+      {enabled && selectedCaIds.map(id => (
+        <input key={`ca${id}`} type="hidden" name="mtlsCaId" value={String(id)} />
       ))}
 
       {/* Header */}
@@ -174,6 +183,35 @@ export function MtlsFields({ value, caCertificates, issuedClientCerts = [], prox
                     {role.description && <span className="text-xs text-muted-foreground ml-2">— {role.description}</span>}
                   </label>
                   <Badge variant="outline" className="text-xs shrink-0">{role.certificateCount} certs</Badge>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+
+        {/* ── Trusted CAs (whole CA) ── */}
+        {caCertificates.length > 0 && (
+          <>
+            <div className="flex items-center gap-2 mb-2">
+              <ShieldCheck className="h-4 w-4 text-amber-500" />
+              <p className="text-xs text-muted-foreground font-semibold uppercase tracking-wide">
+                Trusted CAs (entire CA)
+              </p>
+              {selectedCaIds.length > 0 && (
+                <Badge variant="secondary" className="text-xs ml-auto">{selectedCaIds.length} selected</Badge>
+              )}
+            </div>
+            <div className="rounded-md border bg-background mb-4">
+              {caCertificates.map(ca => (
+                <div key={ca.id} className="flex items-center gap-2.5 px-3 py-2 hover:bg-muted/30 border-b last:border-b-0">
+                  <Checkbox
+                    checked={selectedCaIds.includes(ca.id)}
+                    onCheckedChange={() => toggleCa(ca.id)}
+                  />
+                  <label className="flex-1 min-w-0 cursor-pointer" onClick={() => toggleCa(ca.id)}>
+                    <span className="text-sm font-medium">{ca.name}</span>
+                    <span className="text-xs text-muted-foreground ml-2">— trusts any certificate signed by this CA</span>
+                  </label>
                 </div>
               ))}
             </div>
