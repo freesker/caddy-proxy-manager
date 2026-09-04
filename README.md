@@ -212,6 +212,32 @@ The databases are stored in the `geoip-data` Docker volume and shared between th
 
 Analytics uses a bundled ClickHouse instance for storing and querying traffic events and WAF events. Data is retained for **30 days** by default via ClickHouse's TTL. Change the window with the `CLICKHOUSE_RETENTION_DAYS` environment variable — on the next startup the existing tables' TTL is migrated to the new value and expired data is purged.
 
+### Disk usage
+
+Only the analytics tables should grow, and they stay bounded by the retention TTL above. ClickHouse's own diagnostic system logs (`metric_log`, `asynchronous_metric_log`, `error_log`, …) are a different story: on a stock server they flush every 7.5 seconds **whether or not the proxy sees traffic**, and `metric_log` alone writes roughly 1.3 MiB every four idle minutes. Left on, they fill a data volume at around 12 GB/day.
+
+`docker/clickhouse/config.d/low-disk-write.xml` turns them off. Compose mounts it — and `logging.xml` — as individual files:
+
+```yaml
+volumes:
+  - clickhouse-data:/var/lib/clickhouse
+  - ./docker/clickhouse/config.d/low-disk-write.xml:/etc/clickhouse-server/config.d/low-disk-write.xml:ro
+  - ./docker/clickhouse/config.d/logging.xml:/etc/clickhouse-server/config.d/logging.xml:ro
+```
+
+Mount the files, never the directory. Bind-mounting `config.d` as a whole shadows the image's own `docker_related_config.xml`, which sets `listen_host` — ClickHouse then binds to loopback only and the web container can no longer reach it. Worse, if the source directory does not exist Docker silently creates an empty one, so the overrides apply to nothing and the disk starts filling with no error anywhere.
+
+**If a deployment already ballooned:** update the stack and restart it. On startup the web container drops the disabled system-log tables — including the numbered `_N` copies past ClickHouse upgrades leave behind — and the space comes back immediately (a 55 MB test volume returned to 244 KB). If the ClickHouse user lacks `DROP` on the `system` database the app logs a warning and continues; in that case drop them by hand:
+
+```bash
+docker compose exec clickhouse clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" \
+  --query "SELECT name FROM system.tables WHERE database='system' AND engine LIKE '%MergeTree%' AND match(name,'_log(_[0-9]+)?$')"
+# then, for each name returned:
+#   DROP TABLE IF EXISTS system.<name> SYNC
+```
+
+ClickHouse adds new system logs on most releases, so the override list needs to keep up. `tests/unit/clickhouse-system-logs-config.test.ts` holds the config and the application's reclaim list in sync, and the `clickhouse-system-logs` e2e spec fails if a log table not covered by the override shows up on disk.
+
 ### Enabling analytics (recommended)
 
 Analytics is enabled via the `clickhouse` Docker Compose profile. The default `.env.example` has it on:

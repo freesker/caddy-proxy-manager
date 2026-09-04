@@ -2,26 +2,57 @@
 <!--
   Disables ClickHouse's internal diagnostic system-log tables.
 
-  On stock configuration these tables (metric_log / asynchronous_metric_log in
-  particular) flush every few seconds regardless of user traffic, which writes
-  several GB/day and wears out SSDs even when the proxy is idle. caddy-proxy-manager
-  never queries them, so we turn them off to keep disk writes proportional to
-  actual traffic. Remove this file (and restart ClickHouse) to restore the
-  defaults if you need them for debugging.
+  On stock configuration these tables flush every 7.5 seconds regardless of user
+  traffic, which writes several GB/day and wears out SSDs even when the proxy is
+  idle. metric_log is by far the worst: it carries one column per ProfileEvent,
+  so an idle server still burns ~1.3 MiB every four minutes on it alone.
+  caddy-proxy-manager never queries any of them, so we turn them off to keep disk
+  writes proportional to actual traffic. Server-level diagnostics remain
+  available on stdout/stderr through logging.xml, captured by Docker.
+
+  Keep this list in sync with DISABLED_SYSTEM_LOGS in src/lib/clickhouse/client.ts
+  (tests/unit/clickhouse-system-logs-config.test.ts enforces it). ClickHouse adds
+  new system logs on most releases; a name missing here silently starts filling
+  the data volume again.
+
+  Remove this file (and restart ClickHouse) to restore the defaults if you need
+  them for debugging.
 -->
 <clickhouse>
-    <asynchronous_metric_log remove="1"/>
+    <!-- Timer-driven writers: these flush on a fixed interval even at zero traffic. -->
     <metric_log remove="1"/>
-    <histogram_metric_log remove="1"/>
-    <trace_log remove="1"/>
+    <asynchronous_metric_log remove="1"/>
+    <error_log remove="1"/>
+    <query_metric_log remove="1"/>
+    <background_schedule_pool_log remove="1"/>
+    <asynchronous_insert_log remove="1"/>
+
+    <!-- Per-query and per-part tracing: proportional to traffic, still unused here. -->
     <query_log remove="1"/>
     <query_thread_log remove="1"/>
     <query_views_log remove="1"/>
     <part_log remove="1"/>
     <processors_profile_log remove="1"/>
+    <trace_log remove="1"/>
+    <instrumentation_trace_log remove="1"/>
     <text_log remove="1"/>
-    <session_log remove="1"/>
     <opentelemetry_span_log remove="1"/>
+
+    <!-- Features caddy-proxy-manager never enables. -->
     <blob_storage_log remove="1"/>
     <backup_log remove="1"/>
+    <zookeeper_log remove="1"/>
+    <zookeeper_connection_log remove="1"/>
+    <aggregated_zookeeper_log remove="1"/>
+    <delta_lake_metadata_log remove="1"/>
+    <iceberg_metadata_log remove="1"/>
+
+    <!-- Dropped from newer ClickHouse defaults; kept so older servers stay covered.
+         `remove="1"` on an absent section is a no-op. -->
+    <session_log remove="1"/>
+    <histogram_metric_log remove="1"/>
+
+    <!-- crash_log is deliberately left enabled: it only writes when the server
+         actually crashes, so it costs nothing at idle and is the one diagnostic
+         worth having after an unexpected restart. -->
 </clickhouse>

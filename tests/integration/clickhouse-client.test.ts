@@ -1,4 +1,16 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+
+// docker/clickhouse/config.d/low-disk-write.xml is the single source of truth for
+// which diagnostic system logs are disabled. Deriving the expected pattern from it
+// keeps this test from becoming a stale fourth copy of the list.
+const DISABLED_SYSTEM_LOGS = [
+  ...readFileSync(
+    fileURLToPath(new URL('../../docker/clickhouse/config.d/low-disk-write.xml', import.meta.url)),
+    'utf8',
+  ).matchAll(/<([a-z_]+_log)\s+remove="1"\s*\/>/g),
+].map((m) => m[1]);
 
 describe('clickhouse client analytics enablement', () => {
   afterEach(() => {
@@ -158,13 +170,11 @@ describe('clickhouse client analytics enablement', () => {
     const { initClickHouse } = await import('@/src/lib/clickhouse/client');
     await initClickHouse();
 
-    // The enumeration matches the disabled families plus an optional _<N> suffix,
-    // and now includes histogram_metric_log.
+    // The enumeration matches every family listed in the config override plus an
+    // optional _<N> suffix left behind by past ClickHouse upgrades.
     const enumeration = calls.queries.find((q) => q.query.includes('match(name'));
     expect(enumeration?.params?.pattern).toBe(
-      '^(metric_log|asynchronous_metric_log|trace_log|query_log|query_thread_log|query_views_log|' +
-      'part_log|processors_profile_log|text_log|session_log|opentelemetry_span_log|blob_storage_log|' +
-      'backup_log|histogram_metric_log)(_[0-9]+)?$',
+      `^(${DISABLED_SYSTEM_LOGS.join('|')})(_[0-9]+)?$`,
     );
 
     // Exactly the tables that exist are dropped — the _N leftovers included.

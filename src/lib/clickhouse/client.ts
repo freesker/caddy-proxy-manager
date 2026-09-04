@@ -173,19 +173,34 @@ async function ensureRetentionTtl(ch: ClickHouseClient, table: (typeof RETENTION
 // can now reclaim. Disabling only stops new writes; the old data lingers until
 // the tables are dropped, which is what this list drives.
 const DISABLED_SYSTEM_LOGS = [
+  // Timer-driven writers — these flush every 7.5s even at zero traffic.
   'metric_log',
   'asynchronous_metric_log',
-  'trace_log',
+  'error_log',
+  'query_metric_log',
+  'background_schedule_pool_log',
+  'asynchronous_insert_log',
+  // Per-query and per-part tracing.
   'query_log',
   'query_thread_log',
   'query_views_log',
   'part_log',
   'processors_profile_log',
+  'trace_log',
+  'instrumentation_trace_log',
   'text_log',
-  'session_log',
   'opentelemetry_span_log',
+  // Features caddy-proxy-manager never enables.
   'blob_storage_log',
   'backup_log',
+  'zookeeper_log',
+  'zookeeper_connection_log',
+  'aggregated_zookeeper_log',
+  'delta_lake_metadata_log',
+  'iceberg_metadata_log',
+  // Gone from newer ClickHouse defaults; kept so servers upgraded from older
+  // versions still get their leftover tables dropped.
+  'session_log',
   'histogram_metric_log',
 ] as const;
 
