@@ -882,6 +882,23 @@ async function buildProxyRoutes(
       };
     }
 
+    // Forward the verified client certificate identity to the upstream.
+    // `set` overwrites any client-supplied value to prevent header spoofing.
+    if (meta.mtls?.enabled) {
+      const headers = (reverseProxyHandler.headers ?? {}) as {
+        request?: { set?: Record<string, string[]> };
+      };
+      const request = headers.request ?? {};
+      const set = request.set ?? {};
+      set["X-Client-Cert-Subject"]     = ["{http.request.tls.client.subject}"];
+      set["X-Client-Cert-Fingerprint"] = ["{http.request.tls.client.fingerprint}"];
+      set["X-Client-Cert-Serial"]      = ["{http.request.tls.client.serial}"];
+      request.set = set;
+      headers.request = request;
+      reverseProxyHandler.headers = headers;
+    }
+
+
     // Configure TLS transport for HTTPS upstreams
     if (resolvedUpstreams.hasHttpsUpstream) {
       const tlsTransport: Record<string, unknown> = row.skipHttpsHostnameValidation
