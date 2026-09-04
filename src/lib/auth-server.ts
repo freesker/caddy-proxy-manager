@@ -1,4 +1,4 @@
-import { betterAuth } from "better-auth";
+import { betterAuth, type BetterAuthPlugin } from "better-auth";
 import { genericOAuth, username } from "better-auth/plugins";
 import db, { sqlite } from "./db";
 import * as schema from "./db/schema";
@@ -7,24 +7,52 @@ import { config } from "./config";
 import { decryptSecret, encryptSecret, isEncryptedSecret } from "./secret";
 import type { OAuthProvider } from "./models/oauth-providers";
 import type { GenericOAuthConfig } from "better-auth/plugins";
+import { resolveOAuthAccountIssuer } from "./account-issuer";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let cachedAuth: any = null;
 let cachedProviders: GenericOAuthConfig[] | null = null;
+let cachedTrustedProviderIds: string[] = [];
 
-function mapOAuthProvider(p: OAuthProvider): GenericOAuthConfig {
+/**
+ * OIDC spells the claim `email_verified`; some providers serialize it as a
+ * string. Better Auth's generic-OAuth profile reader only looks at a camelCase
+ * `emailVerified` field, so the claim has to be mapped explicitly.
+ */
+function profileEmailVerified(profile: Record<string, unknown>): boolean {
+  const claim = profile.email_verified ?? profile.emailVerified;
+  return claim === true || claim === "true";
+}
+
+export function mapOAuthProvider(p: OAuthProvider): GenericOAuthConfig {
   const cfg: GenericOAuthConfig = {
     providerId: p.id,
     clientId: p.clientId,
     clientSecret: p.clientSecret,
     scopes: p.scopes ? p.scopes.split(/[\s,]+/).filter(Boolean) : undefined,
     pkce: true,
+    // Security: do not let an OAuth sign-in implicitly create a brand-new
+    // account unless OAuth self-registration is explicitly enabled. Existing
+    // users and (where configured) account linking still work — only first-time
+    // auto-provisioning of an unknown identity is gated. Controlled by its own
+    // flag, independent of credential self-registration.
+    disableImplicitSignUp: !config.auth.allowOauthRegistration,
+    // Better Auth 1.7 scopes external identities by (issuer, accountId).
+    // Pin the namespace to trusted application configuration so a provider
+    // cannot choose or change its account namespace through profile claims.
+    accountIssuer: resolveOAuthAccountIssuer(p.id, p.issuer),
+    // Ownership of an existing CPM account is asserted by the operator through
+    // the provider's auto-link switch, never by the IdP alone. Reporting the
+    // claim only for auto-link providers keeps a provider that merely returns
+    // `email_verified: true` from attaching itself to a local account.
+    mapProfileToUser: (profile) => ({
+      emailVerified: p.autoLink === true && profileEmailVerified(profile),
+    }),
   };
   if (p.authorizationUrl) cfg.authorizationUrl = p.authorizationUrl;
   if (p.tokenUrl) cfg.tokenUrl = p.tokenUrl;
   if (p.userinfoUrl) cfg.userInfoUrl = p.userinfoUrl;
   if (p.issuer) {
-    cfg.issuer = p.issuer;
     // Only use discovery when explicit URLs are not provided
     if (!p.authorizationUrl && !p.tokenUrl) {
       cfg.discoveryUrl = p.issuer.replace(/\/$/, "") + "/.well-known/openid-configuration";
@@ -63,6 +91,7 @@ function loadProvidersSync(): GenericOAuthConfig[] {
       updatedAt: row.updatedAt,
     }));
     cachedProviders = providers.map(mapOAuthProvider);
+    cachedTrustedProviderIds = providers.filter((p) => p.autoLink).map((p) => p.id);
     providersLoadedSuccessfully = true;
   } catch (e) {
     // DB not ready yet — start with empty, will retry on next getAuth() call
@@ -73,9 +102,28 @@ function loadProvidersSync(): GenericOAuthConfig[] {
   return cachedProviders;
 }
 
+/**
+ * Security: force privileged user fields to safe defaults on every
+ * better-auth-managed user creation (OAuth signup, and credential signup when
+ * enabled). better-auth's generic-OAuth signup spreads the raw IdP profile
+ * claims into the new user record (createOAuthUser({...restUserInfo})) and does
+ * NOT honour the `input:false` flags declared on these additionalFields, so
+ * without this a permissive or attacker-influenced IdP returning a `role` (or
+ * `status`) claim could self-provision an admin account.
+ *
+ * Admin-initiated user creation goes through models/user.ts (a direct insert
+ * that bypasses better-auth's database hooks), so legitimate role assignment is
+ * unaffected. `provider`/`subject` are informational, not access-control, and
+ * are intentionally left untouched.
+ */
+export function enforceSafeUserDefaults<T extends object>(user: T): T & { role: string; status: string } {
+  return { ...user, role: "user", status: "active" };
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function createAuth(): any {
   const oauthConfigs = loadProvidersSync();
+  const trustedProviderIds = [...cachedTrustedProviderIds];
 
   return betterAuth({
     database: sqlite,
@@ -114,10 +162,23 @@ function createAuth(): any {
       expiresIn: 7 * 24 * 60 * 60,
       cookieCache: { enabled: false },
     },
-    account: { modelName: "accounts" },
+    account: {
+      modelName: "accounts",
+      accountLinking: {
+        enabled: true,
+        // A provider with "Auto-link accounts" enabled is trusted to prove that
+        // its identity owns the CPM account carrying the same email address.
+        trustedProviders: trustedProviderIds,
+        // CPM has no local email-verification flow, so a user row's
+        // emailVerified is never set and the default gate would refuse every
+        // link. The per-provider trust decision above is the ownership signal.
+        requireLocalEmailVerified: false,
+      },
+    },
     verification: { modelName: "verifications" },
     emailAndPassword: {
       enabled: true,
+      disableSignUp: !config.auth.allowSelfRegistration,
       password: {
         async hash(password: string) {
           const bcrypt = await import("bcryptjs");
@@ -130,6 +191,20 @@ function createAuth(): any {
       },
     },
     databaseHooks: {
+      user: {
+        create: {
+          // By default, never let an external IdP set privileged fields
+          // (role/status) on a newly federated user — see enforceSafeUserDefaults
+          // above. Operators who trust their IdP to manage roles can opt out
+          // with AUTH_ALLOW_OAUTH_ROLE_FROM_CLAIMS=true.
+          before: async (user: Record<string, unknown>) => {
+            if (config.auth.allowOauthRoleFromClaims) {
+              return { data: user };
+            }
+            return { data: enforceSafeUserDefaults(user) };
+          },
+        },
+      },
       account: {
         create: {
           before: async (account) => {
@@ -179,10 +254,14 @@ function createAuth(): any {
       },
     },
     plugins: [
+      // Cast via unknown: better-auth's `username` plugin declares
+      // databaseHooks.user.create.before's `email: string` (required) while BetterAuthPlugin
+      // expects `email?: any`. The mismatch surfaces in some environments and not others, so
+      // the cast keeps the typecheck stable across local and Docker builds.
       username({
         maxUsernameLength: 255,
         usernameValidator: (username) => /^[a-zA-Z0-9_.@-]+$/.test(username),
-      }),
+      }) as unknown as BetterAuthPlugin,
       genericOAuth({ config: oauthConfigs }),
     ],
   });
@@ -202,6 +281,7 @@ export function getAuth(): ReturnType<typeof betterAuth> {
 
 export function invalidateProviderCache(): void {
   cachedProviders = null;
+  cachedTrustedProviderIds = [];
   providersLoadedSuccessfully = false;
   cachedAuth = null;
 }

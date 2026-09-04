@@ -4,9 +4,10 @@ import { SignJWT, jwtVerify } from "jose";
 import { config } from "../config";
 import { findUserByEmail, getUserById } from "../models/user";
 import db from "../db";
-import { users, linkingTokens, accounts } from "../db/schema";
+import { users, linkingTokens, accounts, oauthProviders } from "../db/schema";
 import { and, eq, lt } from "drizzle-orm";
 import { nowIso } from "../db";
+import { resolveOAuthAccountIssuer } from "../account-issuer";
 
 const LINKING_TOKEN_EXPIRY = 5 * 60; // 5 minutes in seconds
 
@@ -24,6 +25,14 @@ export type LinkingTokenPayload = {
   exp: number;
 };
 
+async function getOAuthAccountIssuer(provider: string): Promise<string> {
+  const configuredProvider = await db.select({ issuer: oauthProviders.issuer })
+    .from(oauthProviders)
+    .where(eq(oauthProviders.id, provider))
+    .get();
+  return resolveOAuthAccountIssuer(provider, configuredProvider?.issuer);
+}
+
 /**
  * Determines how to handle an OAuth sign-in attempt
  */
@@ -32,9 +41,10 @@ export async function decideLinkingStrategy(
   providerAccountId: string,
   email: string
 ): Promise<LinkingDecision> {
+  const issuer = await getOAuthAccountIssuer(provider);
   // Check accounts table for existing OAuth connection
   const existingAccount = await db.select().from(accounts).where(
-    and(eq(accounts.providerId, provider), eq(accounts.accountId, providerAccountId))
+    and(eq(accounts.issuer, issuer), eq(accounts.accountId, providerAccountId))
   ).limit(1);
 
   if (existingAccount.length > 0) {
@@ -198,8 +208,10 @@ export async function verifyAndLinkOAuth(
   }
 
   // Insert OAuth account link
+  const issuer = await getOAuthAccountIssuer(provider);
   await db.insert(accounts).values({
     userId,
+    issuer,
     accountId: providerAccountId,
     providerId: provider,
     createdAt: nowIso(),
@@ -230,8 +242,10 @@ export async function autoLinkOAuth(
   }
 
   // Insert OAuth account link
+  const issuer = await getOAuthAccountIssuer(provider);
   await db.insert(accounts).values({
     userId,
+    issuer,
     accountId: providerAccountId,
     providerId: provider,
     createdAt: nowIso(),
@@ -265,8 +279,10 @@ export async function linkOAuthAuthenticated(
   }
 
   // Insert OAuth account link
+  const issuer = await getOAuthAccountIssuer(provider);
   await db.insert(accounts).values({
     userId,
+    issuer,
     accountId: providerAccountId,
     providerId: provider,
     createdAt: nowIso(),

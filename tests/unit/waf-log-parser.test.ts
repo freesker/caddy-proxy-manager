@@ -21,7 +21,94 @@ vi.mock('node:fs', () => ({
   createReadStream: vi.fn(),
 }));
 
-import { extractBracketField, parseLine } from '@/src/lib/waf-log-parser';
+import { extractBracketField, parseLine, ruleInfoFromAuditEntry } from '@/src/lib/waf-log-parser';
+
+/**
+ * Regression (issue #233): rule attribution must come from the audit entry's own
+ * `messages` array (audit log part H), not from a join against waf-rules.log.
+ *
+ * The join only lands when Coraza's audit line and Caddy's rule line happen to be
+ * written within the same 30s parse tick. When it misses, `parseLine` used to drop
+ * the whole event unless it was blocked — so every detected-but-not-blocked event
+ * disappeared. Each test here passes an EMPTY ruleMap to simulate that miss.
+ */
+describe('rule attribution from the audit entry itself', () => {
+  const CRS_XSS =
+    '[client "1.2.3.4"] Coraza: Warning. XSS Attack Detected '
+    + '[file "@owasp_crs/REQUEST-941-APPLICATION-ATTACK-XSS.conf"] [line "123"] '
+    + '[id "941100"] [rev ""] [msg "XSS Attack Detected"] [severity "CRITICAL"] '
+    + '[unique_id "tx-xss"]';
+  const CRS_ANOMALY =
+    '[client "1.2.3.4"] Coraza: Access denied (phase 2). Inbound Anomaly Score Exceeded '
+    + '[file "@owasp_crs/REQUEST-949-BLOCKING-EVALUATION.conf"] [line "7663"] '
+    + '[id "949110"] [msg "Inbound Anomaly Score Exceeded"] [severity "CRITICAL"] '
+    + '[unique_id "tx-xss"]';
+
+  function auditLine(opts: { interrupted: boolean; messages?: unknown[] }): string {
+    return JSON.stringify({
+      transaction: {
+        id: 'tx-xss',
+        client_ip: '1.2.3.4',
+        unix_timestamp: 1_700_000_000_000_000_000,
+        is_interrupted: opts.interrupted,
+        request: { method: 'GET', uri: '/?q=<script>', headers: { host: ['example.com'] } },
+      },
+      ...(opts.messages ? { messages: opts.messages } : {}),
+    });
+  }
+
+  it('keeps a detected-but-not-blocked event when the rules-log join misses', () => {
+    const row = parseLine(
+      auditLine({ interrupted: false, messages: [{ error_message: CRS_XSS }] }),
+      new Map()
+    );
+
+    expect(row).not.toBeNull();
+    expect(row?.blocked).toBe(false);
+    expect(row?.rule_id).toBe(941100);
+    expect(row?.rule_message).toBe('XSS Attack Detected');
+    expect(row?.severity).toBe('CRITICAL');
+  });
+
+  it('attributes a blocked event to the attack rule, not the anomaly evaluation rule', () => {
+    const row = parseLine(
+      auditLine({ interrupted: true, messages: [{ error_message: CRS_XSS }, { error_message: CRS_ANOMALY }] }),
+      new Map()
+    );
+
+    expect(row?.rule_id).toBe(941100);
+  });
+
+  it('skips a leading anomaly-evaluation rule to find the real attack rule', () => {
+    const row = parseLine(
+      auditLine({ interrupted: true, messages: [{ error_message: CRS_ANOMALY }, { error_message: CRS_XSS }] }),
+      new Map()
+    );
+
+    expect(row?.rule_id).toBe(941100);
+  });
+
+  it('still drops audit entries with no rule match and no interruption', () => {
+    // Coraza logs every 4xx/5xx under SecAuditLogRelevantStatus even when no rule
+    // fired; those are ordinary traffic and must not show up as WAF events.
+    expect(parseLine(auditLine({ interrupted: false }), new Map())).toBeNull();
+  });
+
+  it('falls back to the rules-log join when Coraza emits no messages', () => {
+    const ruleMap = new Map([['tx-xss', { ruleId: 941100, ruleMessage: 'XSS Attack Detected', severity: 'CRITICAL' }]]);
+    const row = parseLine(auditLine({ interrupted: false }), ruleMap);
+
+    expect(row?.rule_id).toBe(941100);
+  });
+
+  it('reads the legacy `message` field when `error_message` is absent', () => {
+    expect(ruleInfoFromAuditEntry({ messages: [{ message: CRS_XSS }] })?.ruleId).toBe(941100);
+  });
+
+  it('returns null when the entry has no messages', () => {
+    expect(ruleInfoFromAuditEntry({})).toBeNull();
+  });
+});
 
 describe('extractBracketField', () => {
   it('extracts id from [id "941100"]', () => {

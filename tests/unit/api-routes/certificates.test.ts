@@ -48,13 +48,19 @@ function createMockRequest(options: { method?: string; body?: unknown } = {}): a
   };
 }
 
+const PRIVATE_KEY_SENTINEL = '-----BEGIN PRIVATE KEY-----\nunit-secret-sentinel\n-----END PRIVATE KEY-----';
+
 const sampleCert = {
   id: 1,
-  domains: ['secure.example.com'],
-  type: 'acme',
-  status: 'active',
-  expires_at: '2027-01-01',
-  created_at: '2026-01-01',
+  name: 'Secure certificate',
+  type: 'imported',
+  domainNames: ['secure.example.com'],
+  autoRenew: false,
+  providerOptions: null,
+  certificatePem: '-----BEGIN CERTIFICATE-----\npublic-certificate\n-----END CERTIFICATE-----',
+  privateKeyPem: PRIVATE_KEY_SENTINEL,
+  createdAt: '2026-01-01',
+  updatedAt: '2026-01-01',
 };
 
 beforeEach(() => {
@@ -64,13 +70,32 @@ beforeEach(() => {
 
 describe('GET /api/v1/certificates', () => {
   it('returns list of certificates', async () => {
-    mockList.mockResolvedValue([sampleCert] as any);
+    mockList.mockResolvedValue([{
+      ...sampleCert,
+      futurePrivateMaterial: 'future-secret-field-sentinel',
+    }] as any);
 
     const response = await listGET(createMockRequest());
-    const data = await response.json();
+    const bodyText = await response.text();
+    const data = JSON.parse(bodyText);
 
     expect(response.status).toBe(200);
-    expect(data).toEqual([sampleCert]);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(data).toEqual([{
+      id: sampleCert.id,
+      name: sampleCert.name,
+      type: sampleCert.type,
+      domainNames: sampleCert.domainNames,
+      autoRenew: sampleCert.autoRenew,
+      providerOptions: sampleCert.providerOptions,
+      certificatePem: sampleCert.certificatePem,
+      hasPrivateKey: true,
+      createdAt: sampleCert.createdAt,
+      updatedAt: sampleCert.updatedAt,
+    }]);
+    expect(bodyText).not.toContain(PRIVATE_KEY_SENTINEL);
+    expect(bodyText).not.toContain('privateKeyPem');
+    expect(bodyText).not.toContain('future-secret-field-sentinel');
   });
 
   it('returns 401 on auth failure', async () => {
@@ -84,7 +109,7 @@ describe('GET /api/v1/certificates', () => {
 
 describe('POST /api/v1/certificates', () => {
   it('creates a certificate and returns 201', async () => {
-    const body = { domains: ['new.example.com'], type: 'acme' };
+    const body = { name: 'New certificate', domainNames: ['new.example.com'], type: 'managed' };
     mockCreate.mockResolvedValue({ id: 2, ...body } as any);
 
     const response = await POST(createMockRequest({ method: 'POST', body }));
@@ -92,6 +117,7 @@ describe('POST /api/v1/certificates', () => {
 
     expect(response.status).toBe(201);
     expect(data.id).toBe(2);
+    expect(data.hasPrivateKey).toBe(false);
     expect(mockCreate).toHaveBeenCalledWith(body, 1);
   });
 });
@@ -104,7 +130,10 @@ describe('GET /api/v1/certificates/[id]', () => {
     const data = await response.json();
 
     expect(response.status).toBe(200);
-    expect(data).toEqual(sampleCert);
+    expect(data.hasPrivateKey).toBe(true);
+    expect(data.privateKeyPem).toBeUndefined();
+    expect(JSON.stringify(data)).not.toContain(PRIVATE_KEY_SENTINEL);
+    expect(response.headers.get('cache-control')).toBe('no-store');
   });
 
   it('returns 404 for non-existent certificate', async () => {
@@ -120,14 +149,18 @@ describe('GET /api/v1/certificates/[id]', () => {
 
 describe('PUT /api/v1/certificates/[id]', () => {
   it('updates a certificate', async () => {
-    const body = { domains: ['updated.example.com'] };
-    mockUpdate.mockResolvedValue({ ...sampleCert, domains: ['updated.example.com'] } as any);
+    const body = { domainNames: ['updated.example.com'] };
+    mockUpdate.mockResolvedValue({ ...sampleCert, domainNames: ['updated.example.com'] } as any);
 
     const response = await PUT(createMockRequest({ method: 'PUT', body }), { params: Promise.resolve({ id: '1' }) });
     const data = await response.json();
 
     expect(response.status).toBe(200);
-    expect(data.domains).toEqual(['updated.example.com']);
+    expect(data.domainNames).toEqual(['updated.example.com']);
+    expect(data.hasPrivateKey).toBe(true);
+    expect(data.privateKeyPem).toBeUndefined();
+    expect(JSON.stringify(data)).not.toContain(PRIVATE_KEY_SENTINEL);
+    expect(response.headers.get('cache-control')).toBe('no-store');
     expect(mockUpdate).toHaveBeenCalledWith(1, body, 1);
   });
 
@@ -166,21 +199,21 @@ describe('DELETE /api/v1/certificates/[id]', () => {
 });
 
 describe('POST /api/v1/certificates - input variations', () => {
-  it('creates managed certificate with provider_options', async () => {
+  it('creates managed certificate with provider options', async () => {
     const managedCert = {
       name: 'Wildcard',
       type: 'managed',
-      domain_names: ['*.example.com'],
-      auto_renew: true,
-      provider_options: { api_token: 'cloudflare-token' },
+      domainNames: ['*.example.com'],
+      autoRenew: true,
+      providerOptions: { provider: 'cloudflare', api_token: 'cloudflare-token' },
     };
     mockCreate.mockResolvedValue({
       id: 10,
       ...managedCert,
-      certificate_pem: null,
-      private_key_pem: null,
-      created_at: '2026-01-01T00:00:00Z',
-      updated_at: '2026-01-01T00:00:00Z',
+      certificatePem: null,
+      privateKeyPem: null,
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
     } as any);
 
     const response = await POST(createMockRequest({ method: 'POST', body: managedCert }));
@@ -189,9 +222,11 @@ describe('POST /api/v1/certificates - input variations', () => {
     expect(response.status).toBe(201);
     expect(data.id).toBe(10);
     expect(data.type).toBe('managed');
-    expect(data.provider_options).toEqual({ api_token: 'cloudflare-token' });
-    expect(data.certificate_pem).toBeNull();
-    expect(data.private_key_pem).toBeNull();
+    expect(data.providerOptions).toEqual({ provider: 'cloudflare' });
+    expect(JSON.stringify(data)).not.toContain('cloudflare-token');
+    expect(data.certificatePem).toBeNull();
+    expect(data.hasPrivateKey).toBe(false);
+    expect(data.privateKeyPem).toBeUndefined();
     expect(mockCreate).toHaveBeenCalledWith(managedCert, 1);
   });
 
@@ -199,16 +234,16 @@ describe('POST /api/v1/certificates - input variations', () => {
     const importedCert = {
       name: 'Custom Cert',
       type: 'imported',
-      domain_names: ['custom.example.com'],
-      auto_renew: false,
-      certificate_pem: '-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----',
-      private_key_pem: '-----BEGIN PRIVATE KEY-----\nMIIE...\n-----END PRIVATE KEY-----',
+      domainNames: ['custom.example.com'],
+      autoRenew: false,
+      certificatePem: '-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----',
+      privateKeyPem: PRIVATE_KEY_SENTINEL,
     };
     mockCreate.mockResolvedValue({
       id: 11,
       ...importedCert,
-      created_at: '2026-01-01T00:00:00Z',
-      updated_at: '2026-01-01T00:00:00Z',
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
     } as any);
 
     const response = await POST(createMockRequest({ method: 'POST', body: importedCert }));
@@ -217,8 +252,10 @@ describe('POST /api/v1/certificates - input variations', () => {
     expect(response.status).toBe(201);
     expect(data.id).toBe(11);
     expect(data.type).toBe('imported');
-    expect(data.certificate_pem).toContain('BEGIN CERTIFICATE');
-    expect(data.private_key_pem).toContain('BEGIN PRIVATE KEY');
+    expect(data.certificatePem).toContain('BEGIN CERTIFICATE');
+    expect(data.hasPrivateKey).toBe(true);
+    expect(data.privateKeyPem).toBeUndefined();
+    expect(JSON.stringify(data)).not.toContain(PRIVATE_KEY_SENTINEL);
     expect(mockCreate).toHaveBeenCalledWith(importedCert, 1);
   });
 });
@@ -229,16 +266,13 @@ describe('GET /api/v1/certificates/[id] - full fields', () => {
       id: 1,
       name: 'Full Cert',
       type: 'imported',
-      domains: ['secure.example.com'],
-      domain_names: ['secure.example.com'],
-      status: 'active',
-      auto_renew: false,
-      provider_options: null,
-      certificate_pem: '-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----',
-      private_key_pem: '-----BEGIN PRIVATE KEY-----\nMIIE...\n-----END PRIVATE KEY-----',
-      expires_at: '2027-01-01',
-      created_at: '2026-01-01',
-      updated_at: '2026-01-01',
+      domainNames: ['secure.example.com'],
+      autoRenew: false,
+      providerOptions: null,
+      certificatePem: '-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----',
+      privateKeyPem: PRIVATE_KEY_SENTINEL,
+      createdAt: '2026-01-01',
+      updatedAt: '2026-01-01',
     };
     mockGet.mockResolvedValue(fullCert as any);
 
@@ -249,10 +283,12 @@ describe('GET /api/v1/certificates/[id] - full fields', () => {
     expect(data.id).toBe(1);
     expect(data.name).toBe('Full Cert');
     expect(data.type).toBe('imported');
-    expect(data.certificate_pem).toContain('BEGIN CERTIFICATE');
-    expect(data.private_key_pem).toContain('BEGIN PRIVATE KEY');
-    expect(data.auto_renew).toBe(false);
-    expect(data.created_at).toBe('2026-01-01');
-    expect(data.updated_at).toBe('2026-01-01');
+    expect(data.certificatePem).toContain('BEGIN CERTIFICATE');
+    expect(data.hasPrivateKey).toBe(true);
+    expect(data.privateKeyPem).toBeUndefined();
+    expect(JSON.stringify(data)).not.toContain(PRIVATE_KEY_SENTINEL);
+    expect(data.autoRenew).toBe(false);
+    expect(data.createdAt).toBe('2026-01-01');
+    expect(data.updatedAt).toBe('2026-01-01');
   });
 });

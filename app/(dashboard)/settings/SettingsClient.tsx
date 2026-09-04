@@ -4,7 +4,7 @@ import { useState, useActionState, useEffect, type ReactNode } from "react";
 import {
   Cloud, Globe, Network, Pin, Activity,
   ScrollText, Settings2, UserCheck, MapPin, KeyRound,
-  Search, ChevronRight,
+  Search, ChevronRight, FileWarning, ShieldCheck, Waypoints, Server,
 } from "lucide-react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -20,28 +20,34 @@ import {
   CommandList,
 } from "@/components/ui/command";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { StatusChip } from "@/components/ui/StatusChip";
 import type {
   GeneralSettings,
+  AcmeSettings,
   AuthentikSettings,
   MetricsSettings,
   LoggingSettings,
   DnsSettings,
-  DnsProviderSettings,
   UpstreamDnsResolutionSettings,
   GeoBlockSettings,
+  ErrorPagesSettings,
+  TrustedProxiesSettings,
+  DefaultResponseSettings,
 } from "@/lib/settings";
-import type { DnsProviderDefinition } from "@/src/lib/dns-providers";
+import type { DnsProviderApiStatus, DnsProviderDefinition } from "@/src/lib/dns-providers";
 import { GeoBlockFields } from "@/components/proxy-hosts/GeoBlockFields";
+import { ErrorPagesFields } from "@/components/proxy-hosts/ErrorPagesFields";
 import OAuthProvidersSection from "./OAuthProvidersSection";
 import OAuthRoleMappingsSection from "./OAuthRoleMappingsSection";
-import type { OAuthProvider } from "@/src/lib/models/oauth-providers";
+import type { OAuthProviderView } from "@/src/lib/oauth-provider-view";
 import {
   updateDnsProviderSettingsAction,
   updateGeneralSettingsAction,
+  updateAcmeSettingsAction,
   updateAuthentikSettingsAction,
   updateMetricsSettingsAction,
   updateLoggingSettingsAction,
@@ -54,6 +60,9 @@ import {
   toggleSlaveInstanceAction,
   syncSlaveInstancesAction,
   updateGeoBlockSettingsAction,
+  updateErrorPagesSettingsAction,
+  updateTrustedProxiesSettingsAction,
+  updateDefaultResponseSettingsAction,
 } from "./actions";
 import { cn } from "@/lib/utils";
 
@@ -79,6 +88,8 @@ const SETTINGS_GROUPS: SettingsGroup[] = [
     items: [
       { id: "sync", name: "Instance Sync", desc: "Standalone, master, or slave coordination", icon: <Network className="h-4 w-4" /> },
       { id: "general", name: "General", desc: "Primary domain and ACME contact email", icon: <Settings2 className="h-4 w-4" /> },
+      { id: "acme", name: "ACME Server", desc: "Custom ACME directory URL for internal CAs", icon: <ShieldCheck className="h-4 w-4" /> },
+      { id: "default-response", name: "Default Response", desc: "Handle requests for unknown hosts and direct IP access", icon: <Server className="h-4 w-4" /> },
     ],
   },
   {
@@ -88,6 +99,7 @@ const SETTINGS_GROUPS: SettingsGroup[] = [
       { id: "dns-providers", name: "DNS Providers", desc: "Provider credentials for ACME DNS-01", icon: <Cloud className="h-4 w-4" /> },
       { id: "dns-resolvers", name: "DNS Resolvers", desc: "Custom resolvers for challenge verification", icon: <Globe className="h-4 w-4" /> },
       { id: "upstream-dns", name: "Upstream DNS Pinning", desc: "Pin upstream IPs at config-apply time", icon: <Pin className="h-4 w-4" /> },
+      { id: "trusted-proxies", name: "Trusted Proxies", desc: "Resolve real client IP behind an upstream proxy", icon: <Waypoints className="h-4 w-4" /> },
     ],
   },
   {
@@ -95,6 +107,7 @@ const SETTINGS_GROUPS: SettingsGroup[] = [
     label: "Security",
     items: [
       { id: "geoblock", name: "Global Geoblocking", desc: "Default geoblock rules across all hosts", icon: <MapPin className="h-4 w-4" /> },
+      { id: "error-pages", name: "Error Pages", desc: "Global custom error responses (fallback for all hosts)", icon: <FileWarning className="h-4 w-4" /> },
       { id: "authentik", name: "Authentik Defaults", desc: "Forward-auth defaults for new proxy hosts", icon: <UserCheck className="h-4 w-4" /> },
       { id: "oauth", name: "OAuth Providers", desc: "OAuth/OIDC SSO providers", icon: <KeyRound className="h-4 w-4" /> },
     ],
@@ -369,15 +382,19 @@ function DetailHeader({ activeId }: { activeId: string }) {
 
 type Props = {
   general: GeneralSettings | null;
-  dnsProvider: DnsProviderSettings | null;
+  acme: AcmeSettings | null;
+  dnsProvider: DnsProviderApiStatus | null;
   dnsProviderDefinitions: DnsProviderDefinition[];
   authentik: AuthentikSettings | null;
   metrics: MetricsSettings | null;
   logging: LoggingSettings | null;
   dns: DnsSettings | null;
   upstreamDnsResolution: UpstreamDnsResolutionSettings | null;
+  trustedProxies: TrustedProxiesSettings | null;
+  defaultResponse: DefaultResponseSettings | null;
   globalGeoBlock?: GeoBlockSettings | null;
-  oauthProviders: OAuthProvider[];
+  globalErrorPages?: ErrorPagesSettings | null;
+  oauthProviders: OAuthProviderView[];
   roleMappings: { id: number; providerId: string; role: string; groupId: number }[];
   roleMappingProviders: { id: string; name: string }[];
   roleMappingGroups: { id: number; name: string }[];
@@ -388,12 +405,15 @@ type Props = {
     tokenFromEnv: boolean;
     overrides: {
       general: boolean;
+      acme: boolean;
       dnsProvider: boolean;
       authentik: boolean;
       metrics: boolean;
       logging: boolean;
       dns: boolean;
       upstreamDnsResolution: boolean;
+      trustedProxies: boolean;
+      defaultResponse: boolean;
     };
     slave: {
       hasToken: boolean;
@@ -421,6 +441,7 @@ type Props = {
 
 export default function SettingsClient({
   general,
+  acme,
   dnsProvider,
   dnsProviderDefinitions,
   authentik,
@@ -428,7 +449,10 @@ export default function SettingsClient({
   logging,
   dns,
   upstreamDnsResolution,
+  trustedProxies,
+  defaultResponse,
   globalGeoBlock,
+  globalErrorPages,
   oauthProviders,
   roleMappings,
   roleMappingProviders,
@@ -453,6 +477,7 @@ export default function SettingsClient({
 
   // Form action states
   const [generalState, generalFormAction] = useActionState(updateGeneralSettingsAction, null);
+  const [acmeState, acmeFormAction] = useActionState(updateAcmeSettingsAction, null);
   const [dnsProviderState, dnsProviderFormAction] = useActionState(updateDnsProviderSettingsAction, null);
   const [selectedProvider, setSelectedProvider] = useState("none");
   const configuredProviders = dnsProvider?.providers ? Object.keys(dnsProvider.providers) : [];
@@ -468,10 +493,14 @@ export default function SettingsClient({
   const [slaveInstanceState, slaveInstanceFormAction] = useActionState(createSlaveInstanceAction, null);
   const [syncState, syncFormAction] = useActionState(syncSlaveInstancesAction, null);
   const [geoBlockState, geoBlockFormAction] = useActionState(updateGeoBlockSettingsAction, null);
+  const [errorPagesState, errorPagesFormAction] = useActionState(updateErrorPagesSettingsAction, null);
+  const [trustedProxiesState, trustedProxiesFormAction] = useActionState(updateTrustedProxiesSettingsAction, null);
+  const [defaultResponseState, defaultResponseFormAction] = useActionState(updateDefaultResponseSettingsAction, null);
 
   const isSlave = instanceSync.mode === "slave";
   const isMaster = instanceSync.mode === "master";
   const [generalOverride, setGeneralOverride] = useState(instanceSync.overrides.general);
+  const [acmeOverride, setAcmeOverride] = useState(instanceSync.overrides.acme);
   const [dnsProviderOverride, setDnsProviderOverride] = useState(instanceSync.overrides.dnsProvider);
   const [authentikOverride, setAuthentikOverride] = useState(instanceSync.overrides.authentik);
   const [metricsOverride, setMetricsOverride] = useState(instanceSync.overrides.metrics);
@@ -480,6 +509,8 @@ export default function SettingsClient({
   const [upstreamDnsResolutionOverride, setUpstreamDnsResolutionOverride] = useState(
     instanceSync.overrides.upstreamDnsResolution
   );
+  const [trustedProxiesOverride, setTrustedProxiesOverride] = useState(instanceSync.overrides.trustedProxies);
+  const [defaultResponseOverride, setDefaultResponseOverride] = useState(instanceSync.overrides.defaultResponse);
 
   return (
     <div className="flex min-h-[calc(100vh-3rem)] md:min-h-screen">
@@ -529,6 +560,26 @@ export default function SettingsClient({
                   setGeneralOverride={setGeneralOverride}
                 />
               )}
+              {active === "acme" && (
+                <AcmeSection
+                  acme={acme}
+                  acmeState={acmeState}
+                  acmeFormAction={acmeFormAction}
+                  isSlave={isSlave}
+                  acmeOverride={acmeOverride}
+                  setAcmeOverride={setAcmeOverride}
+                />
+              )}
+              {active === "default-response" && (
+                <DefaultResponseSection
+                  defaultResponse={defaultResponse}
+                  defaultResponseState={defaultResponseState}
+                  defaultResponseFormAction={defaultResponseFormAction}
+                  isSlave={isSlave}
+                  defaultResponseOverride={defaultResponseOverride}
+                  setDefaultResponseOverride={setDefaultResponseOverride}
+                />
+              )}
               {active === "dns-providers" && (
                 <DnsProvidersSection
                   dnsProvider={dnsProvider}
@@ -563,11 +614,28 @@ export default function SettingsClient({
                   setUpstreamDnsResolutionOverride={setUpstreamDnsResolutionOverride}
                 />
               )}
+              {active === "trusted-proxies" && (
+                <TrustedProxiesSection
+                  trustedProxies={trustedProxies}
+                  trustedProxiesState={trustedProxiesState}
+                  trustedProxiesFormAction={trustedProxiesFormAction}
+                  isSlave={isSlave}
+                  trustedProxiesOverride={trustedProxiesOverride}
+                  setTrustedProxiesOverride={setTrustedProxiesOverride}
+                />
+              )}
               {active === "geoblock" && (
                 <GeoBlockSection
                   globalGeoBlock={globalGeoBlock}
                   geoBlockState={geoBlockState}
                   geoBlockFormAction={geoBlockFormAction}
+                />
+              )}
+              {active === "error-pages" && (
+                <ErrorPagesSection
+                  globalErrorPages={globalErrorPages}
+                  errorPagesState={errorPagesState}
+                  errorPagesFormAction={errorPagesFormAction}
                 />
               )}
               {active === "authentik" && (
@@ -904,6 +972,240 @@ function GeneralSection({
   );
 }
 
+// ─── Section: Default Response ──────────────────────────────────────────────
+
+function DefaultResponseSection({
+  defaultResponse,
+  defaultResponseState,
+  defaultResponseFormAction,
+  isSlave,
+  defaultResponseOverride,
+  setDefaultResponseOverride,
+}: {
+  defaultResponse: DefaultResponseSettings | null;
+  defaultResponseState: { success: boolean; message?: string } | null;
+  defaultResponseFormAction: (payload: FormData) => void;
+  isSlave: boolean;
+  defaultResponseOverride: boolean;
+  setDefaultResponseOverride: (v: boolean) => void;
+}) {
+  const [mode, setMode] = useState(defaultResponse?.mode ?? "caddy");
+  const disabled = isSlave && !defaultResponseOverride;
+  const initialHeaders = Object.entries(defaultResponse?.headers ?? {})
+    .map(([name, value]) => `${name}: ${value}`)
+    .join("\n");
+
+  return (
+    <>
+      <FormCard title="Unknown Host Handling">
+        <form action={defaultResponseFormAction} className="flex flex-col gap-3">
+          {defaultResponseState?.message && (
+            <StatusAlert message={defaultResponseState.message} success={defaultResponseState.success} />
+          )}
+          {isSlave && (
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="default-response-override"
+                name="overrideEnabled"
+                checked={defaultResponseOverride}
+                onCheckedChange={(value) => setDefaultResponseOverride(!!value)}
+              />
+              <Label htmlFor="default-response-override">Override master settings</Label>
+            </div>
+          )}
+
+          <FormRow label="Behavior" hint="Applied only when no configured proxy host matches the request.">
+            <Select
+              name="mode"
+              value={mode}
+              onValueChange={(value) => setMode(value as DefaultResponseSettings["mode"])}
+              disabled={disabled}
+            >
+              <SelectTrigger className="w-full sm:w-72" aria-label="Default response behavior">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="caddy">Caddy native behavior</SelectItem>
+                <SelectItem value="respond">Custom HTTP response</SelectItem>
+                <SelectItem value="redirect">Redirect</SelectItem>
+                <SelectItem value="abort">No response (abort connection)</SelectItem>
+              </SelectContent>
+            </Select>
+          </FormRow>
+
+          {mode === "respond" && (
+            <>
+              <FormRow label="Status code" hint="Any final HTTP status from 200 through 599.">
+                <Input
+                  key="default-response-status"
+                  name="status"
+                  type="number"
+                  min={200}
+                  max={599}
+                  defaultValue={defaultResponse?.mode === "respond" ? defaultResponse.status ?? 404 : 404}
+                  required
+                  disabled={disabled}
+                  className="h-8 w-28 font-mono"
+                />
+              </FormRow>
+              <FormRow label="Response body" hint="Plain text, JSON, or custom HTML. Empty is allowed.">
+                <Textarea
+                  name="body"
+                  defaultValue={defaultResponse?.mode === "respond" ? defaultResponse.body ?? "" : ""}
+                  rows={8}
+                  disabled={disabled}
+                  placeholder="Not Found"
+                  className="font-mono text-sm"
+                />
+              </FormRow>
+            </>
+          )}
+
+          {mode === "redirect" && (
+            <>
+              <FormRow label="Redirect status" hint="307 and 308 preserve the original request method.">
+                <Select
+                  name="status"
+                  defaultValue={String(defaultResponse?.mode === "redirect" ? defaultResponse.status ?? 302 : 302)}
+                  disabled={disabled}
+                >
+                  <SelectTrigger className="w-44" aria-label="Default redirect status">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="301">301 Permanent</SelectItem>
+                    <SelectItem value="302">302 Temporary</SelectItem>
+                    <SelectItem value="303">303 See Other</SelectItem>
+                    <SelectItem value="307">307 Temporary</SelectItem>
+                    <SelectItem value="308">308 Permanent</SelectItem>
+                  </SelectContent>
+                </Select>
+              </FormRow>
+              <FormRow label="Redirect URL" hint="Absolute, relative, and Caddy placeholder-based targets are supported.">
+                <Input
+                  name="redirectUrl"
+                  defaultValue={defaultResponse?.mode === "redirect" ? defaultResponse.redirectUrl ?? "" : ""}
+                  required
+                  disabled={disabled}
+                  placeholder="https://example.com{http.request.uri}"
+                  className="h-8 font-mono text-sm"
+                />
+              </FormRow>
+            </>
+          )}
+
+          {(mode === "respond" || mode === "redirect") && (
+            <FormRow
+              label="Response headers"
+              hint="Optional Name: value pairs, one per line. For custom HTML, set Content-Type: text/html; charset=utf-8."
+            >
+              <Textarea
+                key={`default-response-headers-${mode}`}
+                name="headers"
+                defaultValue={
+                  defaultResponse?.mode === mode
+                    ? initialHeaders
+                    : mode === "respond"
+                      ? "Content-Type: text/plain; charset=utf-8"
+                      : ""
+                }
+                rows={4}
+                disabled={disabled}
+                placeholder={"Content-Type: text/html; charset=utf-8\nCache-Control: no-store"}
+                className="font-mono text-sm"
+              />
+            </FormRow>
+          )}
+
+          {mode === "abort" && (
+            <WarnAlert>
+              Caddy will close unmatched HTTP connections without writing a status line or body. This is the native
+              equivalent of a “444 / no response” policy.
+            </WarnAlert>
+          )}
+
+          <div className="flex justify-end">
+            <Button type="submit" size="sm">Save default response</Button>
+          </div>
+        </form>
+      </FormCard>
+      <InfoAlert>
+        Configured hosts always run before this catch-all. For HTTPS, the response can only be sent after a TLS
+        certificate successfully completes the handshake; an unknown hostname or direct IP may fail earlier.
+      </InfoAlert>
+    </>
+  );
+}
+
+// ─── Section: ACME Server ────────────────────────────────────────────────────
+
+function AcmeSection({
+  acme,
+  acmeState,
+  acmeFormAction,
+  isSlave,
+  acmeOverride,
+  setAcmeOverride,
+}: {
+  acme: AcmeSettings | null;
+  acmeState: { success: boolean; message?: string } | null;
+  acmeFormAction: (payload: FormData) => void;
+  isSlave: boolean;
+  acmeOverride: boolean;
+  setAcmeOverride: (v: boolean) => void;
+}) {
+  const disabled = isSlave && !acmeOverride;
+  return (
+    <FormCard title="Custom ACME Directory">
+      <form action={acmeFormAction} className="flex flex-col gap-3">
+        {acmeState?.message && (
+          <StatusAlert message={acmeState.message} success={acmeState.success} />
+        )}
+        {isSlave && (
+          <div className="flex items-center gap-2">
+            <Checkbox
+              id="acme-override"
+              name="overrideEnabled"
+              checked={acmeOverride}
+              onCheckedChange={(v) => setAcmeOverride(!!v)}
+            />
+            <Label htmlFor="acme-override">Override master settings</Label>
+          </div>
+        )}
+        <FormRow
+          label="ACME directory URL"
+          hint="Leave empty to use the Let's Encrypt default. For an internal CA (OpenBao, Step-CA, Windows ADCS), paste its ACME directory URL — must be HTTPS."
+        >
+          <Input
+            name="caUrl"
+            type="url"
+            placeholder="https://ca.internal.example.com/acme/acme/directory"
+            defaultValue={acme?.caUrl ?? ""}
+            disabled={disabled}
+            className="h-8 text-sm font-mono"
+          />
+        </FormRow>
+        <FormRow
+          label="CA root certificate (PEM)"
+          hint="Optional. If the ACME endpoint's TLS certificate is signed by an internal root not in the system trust store, paste the root (or chain) here so Caddy can connect to it."
+        >
+          <Textarea
+            name="caRootPem"
+            placeholder={"-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----"}
+            defaultValue={acme?.caRootPem ?? ""}
+            disabled={disabled}
+            rows={6}
+            className="text-xs font-mono"
+          />
+        </FormRow>
+        <div className="flex justify-end">
+          <Button type="submit" size="sm" disabled={disabled}>Save ACME settings</Button>
+        </div>
+      </form>
+    </FormCard>
+  );
+}
+
 // ─── Section: DNS Providers ──────────────────────────────────────────────────
 
 function DnsProvidersSection({
@@ -918,7 +1220,7 @@ function DnsProvidersSection({
   dnsProviderOverride,
   setDnsProviderOverride,
 }: {
-  dnsProvider: DnsProviderSettings | null;
+  dnsProvider: DnsProviderApiStatus | null;
   dnsProviderDefinitions: DnsProviderDefinition[];
   dnsProviderState: { success: boolean; message?: string } | null;
   dnsProviderFormAction: (payload: FormData) => void;
@@ -1248,6 +1550,103 @@ function UpstreamDnsSection({
   );
 }
 
+// ─── Section: Trusted Proxies ────────────────────────────────────────────────
+
+function TrustedProxiesSection({
+  trustedProxies,
+  trustedProxiesState,
+  trustedProxiesFormAction,
+  isSlave,
+  trustedProxiesOverride,
+  setTrustedProxiesOverride,
+}: {
+  trustedProxies: TrustedProxiesSettings | null;
+  trustedProxiesState: { success: boolean; message?: string } | null;
+  trustedProxiesFormAction: (payload: FormData) => void;
+  isSlave: boolean;
+  trustedProxiesOverride: boolean;
+  setTrustedProxiesOverride: (v: boolean) => void;
+}) {
+  const disabled = isSlave && !trustedProxiesOverride;
+  return (
+    <>
+      <FormCard>
+        <form action={trustedProxiesFormAction} className="flex flex-col gap-3">
+          {trustedProxiesState?.message && (
+            <StatusAlert message={trustedProxiesState.message} success={trustedProxiesState.success} />
+          )}
+          {isSlave && (
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="trusted-proxies-override"
+                name="overrideEnabled"
+                checked={trustedProxiesOverride}
+                onCheckedChange={(v) => setTrustedProxiesOverride(!!v)}
+              />
+              <Label htmlFor="trusted-proxies-override">Override master settings</Label>
+            </div>
+          )}
+          <FormRow
+            label="Trusted proxy ranges"
+            hint="CIDRs, IPs, or the private_ranges shorthand — one per line. When CPM runs behind another proxy, Caddy resolves the real client IP from these. Leave empty to keep the current behaviour."
+          >
+            <Textarea
+              name="ranges"
+              defaultValue={(trustedProxies?.ranges ?? []).join("\n")}
+              disabled={disabled}
+              rows={3}
+              placeholder={"private_ranges\n172.21.0.1/32"}
+              className="font-mono text-sm"
+            />
+          </FormRow>
+          <FormRow
+            label="Client IP headers"
+            hint="Headers Caddy reads the client IP from — one per line. Empty defaults to X-Forwarded-For. Set Cf-Connecting-Ip for Cloudflare, etc."
+          >
+            <Textarea
+              name="clientIpHeaders"
+              defaultValue={(trustedProxies?.client_ip_headers ?? []).join("\n")}
+              disabled={disabled}
+              rows={2}
+              placeholder="X-Forwarded-For"
+              className="font-mono text-sm"
+            />
+          </FormRow>
+          <FormRow label="Strict mode" hint="Only trust the client IP headers from the configured proxies, rejecting spoofed values from untrusted peers.">
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="trusted-proxies-strict"
+                name="strict"
+                defaultChecked={trustedProxies?.strict ?? false}
+                disabled={disabled}
+              />
+              <Label htmlFor="trusted-proxies-strict">Enable strict trusted proxies</Label>
+            </div>
+          </FormRow>
+          <FormRow label="Apply to geoblocking" hint="Use these ranges as the default trusted-proxy list for global geoblocking so the two can't silently disagree. A geoblock list set explicitly wins.">
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="trusted-proxies-geoblock"
+                name="defaultGeoblock"
+                defaultChecked={trustedProxies?.default_geoblock ?? false}
+                disabled={disabled}
+              />
+              <Label htmlFor="trusted-proxies-geoblock">Default geoblock trusted proxies from this list</Label>
+            </div>
+          </FormRow>
+          <div className="flex justify-end">
+            <Button type="submit" size="sm">Save trusted proxies settings</Button>
+          </div>
+        </form>
+      </FormCard>
+      <InfoAlert>
+        Applied to the main HTTP server, so it fixes client-IP attribution everywhere at once — access logs, analytics,
+        the country map, and any downstream handler using <code className="text-xs font-mono">{"{http.request.client_ip}"}</code>.
+      </InfoAlert>
+    </>
+  );
+}
+
 // ─── Section: Global Geoblocking ─────────────────────────────────────────────
 
 function GeoBlockSection({
@@ -1271,6 +1670,36 @@ function GeoBlockSection({
         />
         <div className="flex justify-end">
           <Button type="submit" size="sm">Save geoblocking settings</Button>
+        </div>
+      </form>
+    </FormCard>
+  );
+}
+
+// ─── Section: Error Pages ────────────────────────────────────────────────────
+
+function ErrorPagesSection({
+  globalErrorPages,
+  errorPagesState,
+  errorPagesFormAction,
+}: {
+  globalErrorPages?: ErrorPagesSettings | null;
+  errorPagesState: { success: boolean; message?: string } | null;
+  errorPagesFormAction: (payload: FormData) => void;
+}) {
+  return (
+    <FormCard>
+      <form action={errorPagesFormAction} className="flex flex-col gap-3">
+        {errorPagesState?.message && (
+          <StatusAlert message={errorPagesState.message} success={errorPagesState.success} />
+        )}
+        <p className="text-sm text-muted-foreground">
+          These error pages apply to every proxy host as a fallback. A per-host error page for the
+          same status code takes precedence.
+        </p>
+        <ErrorPagesFields initialData={globalErrorPages?.rules ?? []} />
+        <div className="flex justify-end">
+          <Button type="submit" size="sm">Save error pages</Button>
         </div>
       </form>
     </FormCard>
@@ -1354,7 +1783,7 @@ function OAuthSection({
   oauthProviders,
   baseUrl,
 }: {
-  oauthProviders: OAuthProvider[];
+  oauthProviders: OAuthProviderView[];
   baseUrl: string;
 }) {
   return (

@@ -151,6 +151,38 @@ test.describe('Geo Blocking — form persistence', () => {
   });
 
   /**
+   * Regression (#241): after saving, the form appeared to revert to the
+   * pre-save values until a manual browser refresh. revalidatePath delivers
+   * fresh props, but the form state was seeded from useState/defaultValue
+   * and never re-synced. The form must show the saved values immediately —
+   * no page reload.
+   */
+  test('form reflects saved values immediately without reload', async ({ page }) => {
+    const geoSection = page.locator('form', { has: page.getByRole('button', { name: /save geoblocking settings/i }) });
+    const enableSwitch = geoSection.getByRole('switch');
+    if (!(await enableSwitch.isChecked())) {
+      await enableSwitch.click();
+    }
+
+    await geoSection.getByRole('button', { name: /trusted proxies/i }).click();
+    const redirectInput = geoSection.locator('input[name="geoblockRedirectUrl"]');
+    await expect(redirectInput).toBeVisible();
+    await redirectInput.fill('https://example.com/no-refresh');
+
+    const statusInput = geoSection.locator('input[name="geoblockResponseStatus"]');
+    await statusInput.fill('418');
+
+    await geoSection.getByRole('button', { name: /save geoblocking settings/i }).click();
+    await expect(geoSection.locator('text=/saved|success/i')).toBeVisible({ timeout: 10000 });
+
+    // No page.reload() here — the visible form must already reflect the save.
+    await expect(geoSection.locator('input[name="geoblockRedirectUrl"]'))
+      .toHaveValue('https://example.com/no-refresh', { timeout: 10_000 });
+    await expect(geoSection.locator('input[name="geoblockResponseStatus"]'))
+      .toHaveValue('418');
+  });
+
+  /**
    * Tests the LAN Only (RFC1918) preset — values must survive tab switching.
    * This test does NOT save, so no Caddy config is affected.
    */

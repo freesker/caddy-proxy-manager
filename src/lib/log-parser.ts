@@ -1,10 +1,10 @@
-import { createReadStream, existsSync, statSync } from 'node:fs';
-import { createInterface } from 'node:readline';
+import { existsSync, statSync } from 'node:fs';
 import maxmind, { CountryResponse } from 'maxmind';
 import db from './db';
 import { logParseState } from './db/schema';
 import { eq } from 'drizzle-orm';
 import { insertTrafficEvents, type TrafficEventRow } from './clickhouse/client';
+import { readLines as readLinesFrom } from './log-read';
 
 const LOG_FILE = '/logs/access.log';
 const GEOIP_DB = '/usr/share/GeoIP/GeoLite2-Country.mmdb';
@@ -81,23 +81,60 @@ interface CaddyLogEntry {
   };
 }
 
-// Build a set of signatures from caddy-blocker's "request blocked" entries so we
+type BlockedSignatures = Set<string> | Map<string, number>;
+
+function consumeBlockedSignature(blocked: BlockedSignatures, key: string): boolean {
+  if (blocked instanceof Map) {
+    const count = blocked.get(key) ?? 0;
+    if (count <= 0) return false;
+    if (count === 1) blocked.delete(key);
+    else blocked.set(key, count - 1);
+    return true;
+  }
+  return blocked.has(key);
+}
+
+// How long an unmatched "request blocked" signature is carried across parse
+// passes while waiting for its paired "handled request" row to be written.
+const BLOCKED_CARRYOVER_WINDOW_SEC = 120;
+
+// Signatures collected in one pass but not yet matched to a "handled request"
+// row. caddy-blocker logs "request blocked" immediately before Caddy logs the
+// "handled request", so a parse-tick boundary can fall between the two lines.
+// Carrying the unmatched signatures forward lets the next pass mark them.
+let pendingBlocked: Map<string, number> = new Map();
+
+// Build counted signatures from caddy-blocker's "request blocked" entries so we
 // can mark the corresponding "handled request" rows correctly instead of using
-// status === 403 (which would also catch legitimate upstream 403s).
-export function collectBlockedSignatures(lines: string[]): Set<string> {
-  const blocked = new Set<string>();
+// status === 403 (which would also catch legitimate upstream 403s). Pass an
+// existing map via `into` to merge new signatures onto carried-over ones.
+export function collectBlockedSignatures(lines: string[], into?: Map<string, number>): Map<string, number> {
+  const blocked = into ?? new Map<string, number>();
   for (const line of lines) {
     let entry: CaddyLogEntry;
     try { entry = JSON.parse(line.trim()); } catch { continue; }
     if (entry.msg !== 'request blocked' || entry.plugin !== 'caddy-blocker') continue;
     const ts = Math.floor(entry.ts ?? 0);
     const key = `${ts}|${entry.client_ip ?? ''}|${entry.method ?? ''}|${entry.uri ?? ''}`;
-    blocked.add(key);
+    blocked.set(key, (blocked.get(key) ?? 0) + 1);
   }
   return blocked;
 }
 
-export function parseLine(line: string, blocked: Set<string>): TrafficEventRow | null {
+// Drop carried-over signatures older than the carry-over window so the pending
+// map can't grow unbounded when a "request blocked" line never gets a paired
+// "handled request" row. The timestamp is the first field of the key.
+export function pruneBlockedSignatures(blocked: Map<string, number>, refTs: number): Map<string, number> {
+  const cutoff = refTs - BLOCKED_CARRYOVER_WINDOW_SEC;
+  for (const [key, count] of blocked) {
+    if (count <= 0) { blocked.delete(key); continue; }
+    const ts = Number(key.slice(0, key.indexOf('|')));
+    if (Number.isFinite(ts) && ts < cutoff) blocked.delete(key);
+  }
+  return blocked;
+}
+
+export function parseLine(line: string, blocked: BlockedSignatures): TrafficEventRow | null {
   let entry: CaddyLogEntry;
   try {
     entry = JSON.parse(line);
@@ -128,29 +165,15 @@ export function parseLine(line: string, blocked: Set<string>): TrafficEventRow |
     proto: req.proto ?? '',
     bytes_sent: entry.size ?? 0,
     user_agent: req.headers?.['User-Agent']?.[0] ?? '',
-    is_blocked: blocked.has(key),
+    is_blocked: consumeBlockedSignature(blocked, key),
   };
 }
 
-async function readLines(startOffset: number): Promise<{ lines: string[]; newOffset: number }> {
-  return new Promise((resolve, reject) => {
-    const lines: string[] = [];
-    let bytesRead = 0;
-
-    const stream = createReadStream(LOG_FILE, { start: startOffset, encoding: 'utf8' });
-    stream.on('error', (err: NodeJS.ErrnoException) => {
-      if (err.code === 'ENOENT' || err.code === 'EACCES') resolve({ lines: [], newOffset: startOffset });
-      else reject(err);
-    });
-
-    const rl = createInterface({ input: stream, crlfDelay: Infinity });
-    rl.on('line', (line) => {
-      bytesRead += Buffer.byteLength(line, 'utf8') + 1; // +1 for newline
-      if (line.trim()) lines.push(line.trim());
-    });
-    rl.on('close', () => resolve({ lines, newOffset: startOffset + bytesRead }));
-    rl.on('error', reject);
-  });
+// Re-exported so existing callers/tests keep importing `readLines` from here.
+// The implementation lives in ./log-read because waf-log-parser needs the same
+// newline-safe offset accounting.
+export async function readLines(startOffset: number, file: string = LOG_FILE): Promise<{ lines: string[]; newOffset: number }> {
+  return readLinesFrom(startOffset, file);
 }
 
 async function insertBatch(rows: TrafficEventRow[]): Promise<void> {
@@ -187,10 +210,17 @@ export async function parseNewLogEntries(): Promise<void> {
     const { lines, newOffset } = await readLines(startOffset);
 
     if (lines.length > 0) {
-      const blocked = collectBlockedSignatures(lines);
+      // Merge any signatures carried over from the previous pass (a "request
+      // blocked" line whose "handled request" row hadn't been written yet).
+      const blocked = collectBlockedSignatures(lines, pendingBlocked);
       const rows = lines.map(l => parseLine(l, blocked)).filter(r => r !== null);
       await insertBatch(rows);
-      console.log(`[log-parser] inserted ${rows.length} traffic events (${blocked.size} blocked)`);
+      // Whatever signatures weren't consumed are unmatched blocks; carry the
+      // recent ones forward and drop stale ones so the map can't grow forever.
+      const latestTs = rows.length ? Math.max(...rows.map(r => r.ts)) : Math.floor(Date.now() / 1000);
+      pendingBlocked = pruneBlockedSignatures(blocked, latestTs);
+      const blockedRows = rows.reduce((n, r) => n + (r.is_blocked ? 1 : 0), 0);
+      console.log(`[log-parser] inserted ${rows.length} traffic events (${blockedRows} blocked)`);
     }
 
     setState('access_log_offset', String(newOffset));

@@ -77,6 +77,23 @@ function getPathPriority(paths: string[]) {
   );
 }
 
+export function hostMatchesPattern(host: string, pattern: string): boolean {
+  const normalizedHost = normalizeHostPattern(host);
+  const info = getHostPatternInfo(pattern);
+
+  if (!info.wildcard) {
+    return normalizedHost === info.normalized;
+  }
+
+  const suffix = info.normalized.slice(2);
+  if (!suffix || !normalizedHost.endsWith(`.${suffix}`)) {
+    return false;
+  }
+
+  const subdomain = normalizedHost.slice(0, normalizedHost.length - suffix.length - 1);
+  return subdomain.length > 0 && !subdomain.includes(".");
+}
+
 export function compareHostPatterns(a: string, b: string) {
   const infoA = getHostPatternInfo(a);
   const infoB = getHostPatternInfo(b);

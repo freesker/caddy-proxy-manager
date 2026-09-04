@@ -1,7 +1,11 @@
 import db, { nowIso, toIso } from "../db";
-import { users, accounts } from "../db/schema";
+import { users, accounts, oauthProviders } from "../db/schema";
 import { and, count, eq } from "drizzle-orm";
 import { deleteUserForwardAuthSessions } from "./forward-auth";
+import {
+  CREDENTIAL_ACCOUNT_ISSUER,
+  resolveOAuthAccountIssuer,
+} from "../account-issuer";
 
 export type User = {
   id: number;
@@ -48,8 +52,13 @@ export async function getUserCount(): Promise<number> {
 }
 
 export async function findUserByProviderSubject(provider: string, subject: string): Promise<User | null> {
+  const configuredProvider = await db.select({ issuer: oauthProviders.issuer })
+    .from(oauthProviders)
+    .where(eq(oauthProviders.id, provider))
+    .get();
+  const issuer = resolveOAuthAccountIssuer(provider, configuredProvider?.issuer);
   const account = await db.select().from(accounts).where(
-    and(eq(accounts.providerId, provider), eq(accounts.accountId, subject))
+    and(eq(accounts.issuer, issuer), eq(accounts.accountId, subject))
   ).limit(1);
 
   if (account.length === 0) return null;
@@ -107,6 +116,7 @@ export async function createUser(data: {
   if (provider === "credentials" && data.passwordHash) {
     await db.insert(accounts).values({
       userId: user.id,
+      issuer: CREDENTIAL_ACCOUNT_ISSUER,
       accountId: user.id.toString(),
       providerId: "credential",
       password: data.passwordHash,
@@ -156,7 +166,11 @@ export async function updateUserPassword(userId: number, passwordHash: string): 
       password: passwordHash,
       updatedAt: now,
     })
-    .where(and(eq(accounts.userId, userId), eq(accounts.providerId, "credential")));
+    .where(and(
+      eq(accounts.userId, userId),
+      eq(accounts.providerId, "credential"),
+      eq(accounts.issuer, CREDENTIAL_ACCOUNT_ISSUER)
+    ));
 }
 
 export async function listUsers(): Promise<User[]> {

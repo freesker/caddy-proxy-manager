@@ -20,7 +20,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
@@ -30,5 +30,18 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Type-check clean dependency graph
+        run: bun run typecheck
+
       - name: Run unit and integration tests
         run: bun run test
+
+      - name: Build production application
+        env:
+          NODE_ENV: production
+          NEXT_TELEMETRY_DISABLED: "1"
+          DATABASE_PATH: /tmp/caddy-proxy-manager-build.db
+          DATABASE_URL: file:/tmp/caddy-proxy-manager-build.db
+          SESSION_SECRET: ci-build-session-secret-at-least-32-chars
+          ADMIN_PASSWORD: ci-build-admin-password
+        run: bun run build

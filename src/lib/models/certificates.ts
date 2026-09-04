@@ -3,6 +3,12 @@ import { logAuditEvent } from "../audit";
 import { applyCaddyConfig } from "../caddy";
 import { certificates } from "../db/schema";
 import { desc, eq } from "drizzle-orm";
+import { decryptSecret, encryptSecret, isEncryptedSecret } from "../secret";
+import {
+  normalizeCertificateProviderOptions,
+  parseStoredCertificateProviderOptions,
+  sanitizeStoredCertificateProviderOptions,
+} from "../certificate-provider-options";
 
 export type CertificateType = "managed" | "imported";
 
@@ -38,9 +44,9 @@ function parseCertificate(row: CertificateRow): Certificate {
     type: row.type as CertificateType,
     domainNames: JSON.parse(row.domainNames),
     autoRenew: row.autoRenew,
-    providerOptions: row.providerOptions ? JSON.parse(row.providerOptions) : null,
+    providerOptions: parseStoredCertificateProviderOptions(row.providerOptions),
     certificatePem: row.certificatePem,
-    privateKeyPem: row.privateKeyPem,
+    privateKeyPem: row.privateKeyPem ? decryptSecret(row.privateKeyPem) : null,
     createdAt: toIso(row.createdAt)!,
     updatedAt: toIso(row.updatedAt)!
   };
@@ -72,6 +78,7 @@ function validateCertificateInput(input: CertificateInput) {
 export async function createCertificate(input: CertificateInput, actorUserId: number) {
   validateCertificateInput(input);
   const now = nowIso();
+  const providerOptions = normalizeCertificateProviderOptions(input.providerOptions);
   const [record] = await db
     .insert(certificates)
     .values({
@@ -81,9 +88,9 @@ export async function createCertificate(input: CertificateInput, actorUserId: nu
         Array.from(new Set(input.domainNames.map((domain) => domain.trim().toLowerCase())))
       ),
       autoRenew: input.autoRenew ?? true,
-      providerOptions: input.providerOptions ? JSON.stringify(input.providerOptions) : null,
+      providerOptions: providerOptions ? JSON.stringify(providerOptions) : null,
       certificatePem: input.certificatePem ?? null,
-      privateKeyPem: input.privateKeyPem ?? null,
+      privateKeyPem: input.privateKeyPem ? encryptSecret(input.privateKeyPem) : null,
       createdAt: now,
       updatedAt: now,
       createdBy: actorUserId
@@ -124,6 +131,7 @@ export async function updateCertificate(id: number, input: Partial<CertificateIn
   validateCertificateInput(merged);
 
   const now = nowIso();
+  const providerOptions = normalizeCertificateProviderOptions(merged.providerOptions);
   await db
     .update(certificates)
     .set({
@@ -131,9 +139,9 @@ export async function updateCertificate(id: number, input: Partial<CertificateIn
       type: merged.type,
       domainNames: JSON.stringify(Array.from(new Set(merged.domainNames))),
       autoRenew: merged.autoRenew,
-      providerOptions: merged.providerOptions ? JSON.stringify(merged.providerOptions) : null,
+      providerOptions: providerOptions ? JSON.stringify(providerOptions) : null,
       certificatePem: merged.certificatePem ?? null,
-      privateKeyPem: merged.privateKeyPem ?? null,
+      privateKeyPem: merged.privateKeyPem ? encryptSecret(merged.privateKeyPem) : null,
       updatedAt: now
     })
     .where(eq(certificates.id, id));
@@ -164,4 +172,41 @@ export async function deleteCertificate(id: number, actorUserId: number) {
     summary: `Deleted certificate ${existing.name}`
   });
   await applyCaddyConfig();
+}
+
+/**
+ * Encrypt private keys and remove arbitrary provider-option fields written by
+ * older releases. The scan is idempotent and intentionally does not rely on a
+ * one-time flag, so restored legacy backups are repaired on the next startup.
+ */
+export async function migrateLegacyCertificateStorage(): Promise<number> {
+  const rows = await db
+    .select({
+      id: certificates.id,
+      privateKeyPem: certificates.privateKeyPem,
+      providerOptions: certificates.providerOptions,
+    })
+    .from(certificates);
+  let migrated = 0;
+
+  for (const row of rows) {
+    const updates: Partial<Pick<CertificateRow, "privateKeyPem" | "providerOptions">> = {};
+    if (row.privateKeyPem && !isEncryptedSecret(row.privateKeyPem)) {
+      updates.privateKeyPem = encryptSecret(row.privateKeyPem);
+    }
+
+    const providerOptions = sanitizeStoredCertificateProviderOptions(row.providerOptions);
+    if (providerOptions !== row.providerOptions) {
+      updates.providerOptions = providerOptions;
+    }
+
+    if (Object.keys(updates).length === 0) continue;
+    await db
+      .update(certificates)
+      .set(updates)
+      .where(eq(certificates.id, row.id));
+    migrated += 1;
+  }
+
+  return migrated;
 }

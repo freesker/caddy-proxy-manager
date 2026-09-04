@@ -12,7 +12,7 @@ Web interface for managing [Caddy Server](https://caddyserver.com/) reverse prox
 
 ## Overview
 
-This project provides a web UI for Caddy Server, eliminating the need to manually edit JSON configurations or Caddyfiles. It handles reverse proxies, access lists, and certificate management through a shadcn/ui interface. Built with Next.js 16, React 19, shadcn/ui, Tailwind CSS, Drizzle ORM, and TypeScript. Analytics data (traffic events, WAF events) is stored in ClickHouse for fast aggregation queries, with automatic 90-day retention via TTL.
+This project provides a web UI for Caddy Server, eliminating the need to manually edit JSON configurations or Caddyfiles. It handles reverse proxies, access lists, and certificate management through a shadcn/ui interface. Built with Next.js 16, React 19, shadcn/ui, Tailwind CSS, Drizzle ORM, and TypeScript. Analytics data (traffic events, WAF events) is stored in ClickHouse for fast aggregation queries, with automatic retention via TTL (30 days by default, configurable).
 
 ---
 
@@ -55,9 +55,10 @@ Data persists in Docker volumes (caddy-manager-data, caddy-data, caddy-config, c
 - **REST API** - Full REST API under `/api/v1/` with Bearer token authentication, covering all resources. Interactive OpenAPI 3.1.0 docs at `/api-docs`
 - **API Tokens** - Create and manage API tokens with optional expiration for programmatic access
 - **Instance Sync** - Master/slave configuration sync for multi-instance deployments. The master pushes proxy hosts, certificates, access lists, and settings to slaves on every change
+- **Default Response** - Replace Caddy's native behavior for unknown hosts or direct-IP requests with a custom status/body/headers, redirect, or connection abort
 - **OAuth / SSO** - OAuth2/OIDC authentication with any compliant provider (Authentik, Keycloak, Auth0, etc.). Account linking from the Profile page
-- **DNS Providers** - Multi-provider DNS-01 challenge support for ACME certificates: Cloudflare, Route 53, DigitalOcean, Duck DNS, Hetzner, Vultr, Porkbun, GoDaddy, Namecheap, OVH, IONOS, Linode, Njalla, and Infomaniak. Credentials encrypted at rest. Per-certificate provider override supported
-- **Settings** - ACME email, DNS provider configuration, upstream DNS pinning defaults, Authentik outpost, Prometheus metrics, logging format
+- **DNS Providers** - Multi-provider DNS-01 challenge support for ACME certificates: Cloudflare, Route 53, DigitalOcean, Duck DNS, Hetzner, Vultr, Porkbun, GoDaddy, Namecheap, OVH, IONOS, Linode, Njalla, netcup, Spaceship, deSEC, Dynu, acme-dns, Infomaniak, and ClouDNS. Credentials encrypted at rest. Per-certificate provider override supported
+- **Settings** - ACME email, default response, DNS provider configuration, upstream DNS pinning defaults, Authentik outpost, Prometheus metrics, logging format
 - **Audit Log** - Searchable configuration change history with user attribution and pagination
 - **Search & Pagination** - Server-side search and pagination on all data tables
 - **Dark Mode** - Full dark/light theme support with system preference detection
@@ -91,12 +92,14 @@ Data persists in Docker volumes (caddy-manager-data, caddy-data, caddy-config, c
 | `OAUTH_USERINFO_URL` | Optional OAuth userinfo endpoint override | Auto-discovered from `OAUTH_ISSUER` | No |
 | `OAUTH_ALLOW_AUTO_LINKING` | Allow auto-linking OAuth identities to existing users | `false` | No |
 | `AUTH_TRUST_HOST` | Trust the Host header for URL construction (only behind proxies that rewrite Host) | `false` | No |
+| `AUTH_ALLOW_SELF_REGISTRATION` | Allow public email/password account registration | `false` | No |
+| `AUTH_ALLOW_OAUTH_REGISTRATION` | Allow first-time OAuth/OIDC identities to create user accounts | `false` | No |
 | `AUTH_RATE_LIMIT_ENABLED` | Enable Better Auth rate limiting | `true` | No |
 | `AUTH_RATE_LIMIT_WINDOW` | Rate limit window in seconds | `60` | No |
 | `AUTH_RATE_LIMIT_MAX` | Max requests per window | `5` | No |
 | `INSTANCE_MODE` | Instance role: `standalone`, `master`, or `slave` | `standalone` | No |
-| `INSTANCE_SYNC_TOKEN` | Bearer token slaves use to authenticate sync requests | None | No (required if `slave`) |
-| `INSTANCE_SLAVES` | JSON array of slave instances for the master to push to | None | No |
+| `INSTANCE_SYNC_TOKEN` | Bearer token slaves use to authenticate sync requests (32+ characters) | None | No (required if `slave`) |
+| `INSTANCE_SLAVES` | JSON array of slave instances for the master to push to (tokens must be 32+ characters) | None | No |
 | `INSTANCE_SYNC_INTERVAL` | Periodic sync interval in seconds (`0` = disabled) | `0` | No |
 | `INSTANCE_SYNC_ALLOW_HTTP` | Allow sync over HTTP (for internal Docker networks) | `false` | No |
 | `CLICKHOUSE_URL` | ClickHouse HTTP endpoint for analytics | `http://clickhouse:8123` | No |
@@ -130,7 +133,6 @@ docker compose up -d
 ```
 
 **Limitations:**
-- Certificate private keys stored unencrypted in SQLite
 - In-memory rate limiting (not suitable for multi-instance deployments)
 
 ---
@@ -147,10 +149,14 @@ CPM has three roles with increasing privileges:
 | Manage proxy hosts, certificates, access lists | No | No | Yes |
 | Manage users, groups, and settings | No | No | Yes |
 | View analytics, audit log, and API docs | No | No | Yes |
-| Create and manage API tokens | No | No | Yes |
-| Access the REST API (`/api/v1/`) | No | No | Yes |
+| Create and manage own API tokens | Yes | Yes | Yes |
+| Access role-appropriate REST API endpoints (`/api/v1/`) | Yes | Yes | Yes |
 
 New users default to the **user** role. The initial admin account is created from the `ADMIN_USERNAME` / `ADMIN_PASSWORD` environment variables.
+
+API tokens can only be created from an authenticated dashboard session; an
+existing bearer token cannot mint replacement credentials. Viewer and user
+tokens are restricted to the same user-scoped API capabilities as their owner.
 
 > **Forward Auth access** is separate from role — all roles must be explicitly granted access to each protected host via the forward auth access list.
 
@@ -160,9 +166,9 @@ New users default to the **user** role. The initial admin account is created fro
 
 Caddy automatically obtains Let's Encrypt certificates for all proxy hosts.
 
-**DNS-01 Challenge** (optional): Configure a DNS provider in **Settings → DNS Providers** for wildcard certificates and environments where ports 80/443 are not public. Supported providers: Cloudflare, Route 53, DigitalOcean, Duck DNS, Hetzner, Vultr, Porkbun, GoDaddy, Namecheap, OVH, IONOS, Linode, Njalla, and Infomaniak. Credentials are encrypted at rest with AES-256-GCM. You can override the DNS provider per certificate.
+**DNS-01 Challenge** (optional): Configure a DNS provider in **Settings → DNS Providers** for wildcard certificates and environments where ports 80/443 are not public. Supported providers: Cloudflare, Route 53, DigitalOcean, Duck DNS, Hetzner, Vultr, Porkbun, GoDaddy, Namecheap, OVH, IONOS, Linode, Njalla, netcup, Spaceship, deSEC, Dynu, acme-dns, Infomaniak, and ClouDNS. Credentials are encrypted at rest with AES-256-GCM. You can override the DNS provider per certificate.
 
-**Custom Certificates** (optional): Import your own certificates via the Certificates page. Private keys are stored unencrypted in SQLite.
+**Custom Certificates** (optional): Import your own certificates via the Certificates page. Private keys are encrypted at rest with AES-256-GCM, migrated from legacy plaintext storage on startup, and treated as write-only by ordinary API responses and browser payloads.
 
 ---
 
@@ -204,7 +210,7 @@ The databases are stored in the `geoip-data` Docker volume and shared between th
 
 ## Analytics
 
-Analytics uses a bundled ClickHouse instance for storing and querying traffic events and WAF events. Data is retained for **90 days** via ClickHouse's TTL.
+Analytics uses a bundled ClickHouse instance for storing and querying traffic events and WAF events. Data is retained for **30 days** by default via ClickHouse's TTL. Change the window with the `CLICKHOUSE_RETENTION_DAYS` environment variable — on the next startup the existing tables' TTL is migrated to the new value and expired data is purged.
 
 ### Enabling analytics (recommended)
 
@@ -268,20 +274,37 @@ SecRule REQUEST_URI "@beginsWith /api/" "id:9001,phase:1,ctl:ruleEngine=Off,nolo
 Run a master instance that pushes configuration to one or more slaves on every change.
 
 ```bash
+# Generate once, then configure the same 64-character value on both sides.
+openssl rand -hex 32
+
 # Master
 INSTANCE_MODE=master
-INSTANCE_SLAVES='[{"name":"replica","url":"https://replica.example.com","token":"<32-char-token>"}]'
+INSTANCE_SLAVES='[{"name":"replica","url":"https://replica.example.com","token":"<64-hex-character-token>"}]'
 
 # Slave
 INSTANCE_MODE=slave
-INSTANCE_SYNC_TOKEN=<32-char-token>
+INSTANCE_SYNC_TOKEN=<64-hex-character-token>
 ```
+
+Sync tokens shorter than 32 characters, longer than 512 characters, or padded with whitespace are rejected.
 
 Synced data: proxy hosts, certificates, access lists, and settings. User accounts are **not** synced.
 
 Use HTTPS slave URLs in production. Set `INSTANCE_SYNC_ALLOW_HTTP=true` only for internal Docker networks.
 
 See the [Environment Variables Reference](https://github.com/fuomag9/caddy-proxy-manager/wiki/Environment-Variables-Reference) for all `INSTANCE_*` options.
+
+---
+
+## Default Response
+
+Configure **Settings → Default Response** to preserve Caddy's native behavior for unmatched HTTP requests (such as an automatic HTTPS redirect or empty response, depending on the generated server config), or replace it with:
+
+- a custom HTTP status, body, and response headers (including custom HTML);
+- a redirect; or
+- an aborted connection with no HTTP response (the Caddy equivalent of an nginx `444`).
+
+Configured proxy hosts always take precedence over this catch-all. For HTTPS, Caddy can only send the response after TLS succeeds; an unknown hostname or direct-IP request may fail the certificate handshake first.
 
 ---
 
@@ -329,20 +352,31 @@ OAUTH_ISSUER=https://auth.example.com/application/o/app/
 
 The callback URL format is:
 ```
-{BASE_URL}/api/auth/oauth2/callback/{provider-id}
+{BASE_URL}/api/auth/callback/{provider-id}
 ```
 
 For environment-configured providers, the provider ID is derived from `OAUTH_PROVIDER_NAME` (lowercased, non-alphanumeric replaced with `-`). The exact callback URL is shown in **Settings → OAuth Providers** after the provider is synced.
 
 Examples:
-- `https://caddy-manager.example.com/api/auth/oauth2/callback/authentik-QXV0aG` (production)
-- `http://localhost:3000/api/auth/oauth2/callback/authentik-QXV0aG` (development)
+- `https://caddy-manager.example.com/api/auth/callback/authentik-QXV0aG` (production)
+- `http://localhost:3000/api/auth/callback/authentik-QXV0aG` (development)
 
 The `BASE_URL` environment variable must match exactly where users access your dashboard.
 
 > **Upgrading from < 1.0-RC:** The old callback URL (`/api/auth/callback/oauth2`) no longer works. Update your OAuth provider's redirect URI to the new format shown in **Settings → OAuth Providers**.
 
-OAuth login appears on the login page alongside credentials. Users can link OAuth to existing accounts from the Profile page.
+OAuth login appears on the login page alongside credentials.
+
+**Account linking:**
+
+Attaching an OAuth identity to an existing CPM user requires **Auto-link accounts** to be enabled for that provider (**Settings → OAuth Providers**, or `OAUTH_ALLOW_AUTO_LINKING=true` for environment-configured providers). The switch marks the provider as trusted to prove that its identity owns the CPM account carrying the same email address, so leave it off for any IdP where users can register an arbitrary email themselves.
+
+With it enabled:
+
+- Signing in through the provider links the identity to the existing user with the matching email.
+- **Profile → OAuth Connections** can link the provider to the signed-in account. The provider's email must match the signed-in user's email.
+
+With it disabled, both paths are refused and the provider redirects to `/api/auth/error?error=account_not_linked`.
 
 ### Restricting host access by Keycloak role
 

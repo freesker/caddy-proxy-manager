@@ -3,6 +3,7 @@ import db, { nowIso } from "../db";
 import { oauthProviders } from "../db/schema";
 import { eq } from "drizzle-orm";
 import { encryptSecret, decryptSecret } from "../secret";
+import { toOAuthProviderView, type OAuthProviderView } from "../oauth-provider-view";
 
 export type OAuthProvider = {
   id: string;
@@ -89,11 +90,11 @@ export async function createOAuthProvider(data: {
   return parseDbProvider(row);
 }
 
-export async function listOAuthProviders(): Promise<OAuthProvider[]> {
+export async function listOAuthProviders(): Promise<OAuthProviderView[]> {
   const rows = await db.query.oauthProviders.findMany({
     orderBy: (table, { asc }) => asc(table.name),
   });
-  return rows.map(parseDbProvider);
+  return rows.map((row) => toOAuthProviderView(parseDbProvider(row)));
 }
 
 export async function listEnabledOAuthProviders(): Promise<OAuthProvider[]> {
@@ -142,7 +143,11 @@ export async function updateOAuthProvider(
   if (data.name !== undefined) updates.name = data.name;
   if (data.type !== undefined) updates.type = data.type;
   if (data.clientId !== undefined) updates.clientId = encryptSecret(data.clientId);
-  if (data.clientSecret !== undefined) updates.clientSecret = encryptSecret(data.clientSecret);
+  // A blank value means "preserve" at the server boundary as well as in the
+  // UI. Rotation requires an explicit non-empty replacement.
+  if (data.clientSecret !== undefined && data.clientSecret.trim().length > 0) {
+    updates.clientSecret = encryptSecret(data.clientSecret.trim());
+  }
   if (data.issuer !== undefined) updates.issuer = data.issuer;
   if (data.authorizationUrl !== undefined) updates.authorizationUrl = data.authorizationUrl;
   if (data.tokenUrl !== undefined) updates.tokenUrl = data.tokenUrl;
@@ -179,11 +184,13 @@ export async function deleteOAuthProvider(id: string): Promise<void> {
   await db.delete(oauthProviders).where(eq(oauthProviders.id, id));
 }
 
-export async function getProviderDisplayList(): Promise<Array<{ id: string; name: string }>> {
+export async function getProviderDisplayList(): Promise<
+  Array<{ id: string; name: string; autoLink: boolean }>
+> {
   const rows = await db.query.oauthProviders.findMany({
     where: (table, { eq }) => eq(table.enabled, true),
     orderBy: (table, { asc }) => asc(table.name),
-    columns: { id: true, name: true },
+    columns: { id: true, name: true, autoLink: true },
   });
-  return rows.map((r) => ({ id: r.id, name: r.name }));
+  return rows.map((r) => ({ id: r.id, name: r.name, autoLink: r.autoLink }));
 }

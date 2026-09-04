@@ -3,8 +3,37 @@ import { applyCaddyConfig } from "../caddy";
 import { logAuditEvent } from "../audit";
 import { proxyHosts } from "../db/schema";
 import { asc, desc, eq, count, like, or } from "drizzle-orm";
-import { type GeoBlockSettings } from "../settings";
+import { type GeoBlockSettings, getDnsProviderSettings } from "../settings";
 import { normalizeProxyHostDomains } from "../proxy-host-domains";
+import { ApiValidationError } from "../api-errors";
+import { bodyLimitRangeMessage, findInvalidBodyLimitDirective, isValidBodyLimit } from "../caddy-waf";
+
+/**
+ * Wildcard certificates (e.g. "*.example.com") can only be issued via the ACME
+ * DNS-01 challenge — HTTP-01/TLS-ALPN-01 cannot satisfy a wildcard. When a host
+ * carries a wildcard domain and relies on auto-managed TLS (no certificate
+ * assigned), Caddy will silently fail to obtain a certificate unless a DNS
+ * provider is configured. Block that misconfiguration up front with a clear error.
+ */
+export async function assertWildcardIssuable(domains: string[], certificateId: number | null) {
+  // An explicitly assigned certificate (imported, or managed with its own
+  // provider) is the admin's responsibility — only guard the auto-managed path.
+  if (certificateId != null) {
+    return;
+  }
+  const wildcardDomains = domains.filter((domain) => domain.startsWith("*."));
+  if (wildcardDomains.length === 0) {
+    return;
+  }
+  const dnsSettings = await getDnsProviderSettings();
+  const hasDnsProvider = Boolean(dnsSettings?.default && dnsSettings.providers[dnsSettings.default]);
+  if (!hasDnsProvider) {
+    throw new ApiValidationError(
+      `Wildcard domain "${wildcardDomains[0]}" requires a DNS provider for the ACME DNS-01 challenge. ` +
+        `Configure a default DNS provider in settings, or assign a certificate to this host.`
+    );
+  }
+}
 
 // Security: Only the protocol scheme is validated (http/https). Host/IP targets are
 // not restricted — admins intentionally need to proxy to internal services.
@@ -57,6 +86,51 @@ export type RewriteConfig = {
 export type LocationRule = {
   path: string;      // Caddy path pattern, e.g. "/ws/*", "/api/*"
   upstreams: string[]; // e.g. ["backend:8080", "backend2:8080"]
+  loadBalancer: LoadBalancerConfig | null; // optional per-rule load balancing / health checks
+};
+
+export type LocationRuleInput = {
+  path: string;
+  upstreams: string[];
+  loadBalancer?: LoadBalancerInput | null;
+};
+
+// Stored (meta JSON) shape of a location rule. The load balancer is held in the
+// same snake_case meta shape used for the host-level load balancer.
+export type LocationRuleMeta = {
+  path: string;
+  upstreams: string[];
+  load_balancer?: LoadBalancerMeta;
+};
+
+export const PATH_BLOCK_STATUS_CODES = [400, 401, 403, 404, 410, 418, 451, 500, 502, 503] as const;
+export type PathBlockStatusCode = (typeof PATH_BLOCK_STATUS_CODES)[number];
+
+export type PathBlockRule = {
+  path: string;                    // Caddy path pattern, e.g. "/dns-query"
+  status: PathBlockStatusCode;     // status code to return, e.g. 403
+  body?: string;                   // optional response body, e.g. "Forbidden"
+};
+
+export type PathRewriteRule = {
+  from: string;   // path pattern, e.g. "/secretpath"
+  to: string;     // internal target URI, e.g. "/dns-query"
+};
+
+// Suggested status codes for the error-page UI. Any 4xx/5xx code is accepted by
+// the sanitizer; this list only drives the picker.
+export const ERROR_PAGE_STATUS_CODES = [400, 401, 403, 404, 408, 429, 500, 502, 503, 504] as const;
+
+export type ErrorPageRule = {
+  statuses: number[];     // error codes this rule handles, e.g. [502, 503, 504]; empty = all errors
+  body: string;           // response body (HTML/text); the original status code is preserved
+  contentType?: string;   // optional Content-Type, defaults to "text/html; charset=utf-8"
+};
+
+export type PathAllowRule = {
+  path: string;   // Caddy path pattern, e.g. "/secret" — matches short-circuit the
+                  // subroute (no block applies) and the request falls through to the
+                  // upstream proxy.
 };
 
 export type WafHostConfig = {
@@ -66,6 +140,11 @@ export type WafHostConfig = {
   custom_directives?: string;
   excluded_rule_ids?: number[];
   waf_mode?: WafMode;
+  // Request body limits in bytes; unset inherits the global WAF setting.
+  // Coraza rejects anything above 1 GiB at config-load time.
+  request_body_limit?: number;
+  request_body_in_memory_limit?: number;
+  request_body_limit_action?: 'Reject' | 'ProcessPartial';
 };
 
 // Load Balancer Types
@@ -247,6 +326,38 @@ export type MtlsConfig = {
   ca_certificate_ids?: number[];
 };
 
+/**
+ * Rejects per-host WAF body limits Coraza would refuse. Coraza builds its WAF
+ * while Caddy loads the config, so one bad value here makes Caddy reject the
+ * whole document and *every* host stops being reconfigured — worth failing the
+ * write with a clear message instead.
+ */
+function validateWafMeta(waf: WafHostConfig): WafHostConfig {
+  for (const key of ["request_body_limit", "request_body_in_memory_limit"] as const) {
+    const value = waf[key];
+    if (value === undefined || value === null) continue;
+    if (!isValidBodyLimit(value)) throw new ApiValidationError(bodyLimitRangeMessage(`waf.${key}`));
+  }
+  const action = waf.request_body_limit_action;
+  if (action !== undefined && action !== "Reject" && action !== "ProcessPartial") {
+    throw new ApiValidationError("waf.request_body_limit_action must be Reject or ProcessPartial");
+  }
+  if (
+    typeof waf.request_body_limit === "number" &&
+    typeof waf.request_body_in_memory_limit === "number" &&
+    waf.request_body_in_memory_limit > waf.request_body_limit
+  ) {
+    throw new ApiValidationError("waf.request_body_in_memory_limit must not exceed waf.request_body_limit");
+  }
+  // Safe to echo: findInvalidBodyLimitDirective only ever returns a line that
+  // matched `<known directive name> <digits>`, never free-form user text.
+  const badDirective = findInvalidBodyLimitDirective(waf.custom_directives);
+  if (badDirective) {
+    throw new ApiValidationError(`waf.custom_directives has an out-of-range body limit: "${badDirective}" — ${bodyLimitRangeMessage("the byte count")}`);
+  }
+  return waf;
+}
+
 function sanitizeMtlsMeta(meta: MtlsConfig | undefined): MtlsConfig | undefined {
   if (!meta?.enabled) {
     return undefined;
@@ -289,6 +400,17 @@ function sanitizeMtlsMeta(meta: MtlsConfig | undefined): MtlsConfig | undefined 
     }
   }
 
+  // Reject enabling mTLS with no trust material at all. Such a config would
+  // otherwise fail open (no client_authentication block is emitted for the
+  // host). Note this cannot catch a role that is later emptied via revocation —
+  // the config still references a valid role — which is why Caddy config
+  // generation also fails closed for the zero-resolved-trust case.
+  if (!normalized.trusted_client_cert_ids && !normalized.trusted_role_ids && !normalized.ca_certificate_ids) {
+    throw new ApiValidationError(
+      "mTLS is enabled but no trusted client certificates, roles, or CA certificates are selected. Select at least one or disable mTLS."
+    );
+  }
+
   return normalized;
 }
 
@@ -324,7 +446,11 @@ type ProxyHostMeta = {
   cpm_forward_auth?: CpmForwardAuthMeta;
   redirects?: RedirectRule[];
   rewrite?: RewriteConfig;
-  location_rules?: LocationRule[];
+  location_rules?: LocationRuleMeta[];
+  path_allows?: PathAllowRule[];
+  path_blocks?: PathBlockRule[];
+  path_rewrites?: PathRewriteRule[];
+  error_pages?: ErrorPageRule[];
 };
 
 export type ProxyHost = {
@@ -357,6 +483,10 @@ export type ProxyHost = {
   redirects: RedirectRule[];
   rewrite: RewriteConfig | null;
   locationRules: LocationRule[];
+  pathAllows: PathAllowRule[];
+  pathBlocks: PathBlockRule[];
+  pathRewrites: PathRewriteRule[];
+  errorPages: ErrorPageRule[];
 };
 
 export type ProxyHostInput = {
@@ -385,7 +515,11 @@ export type ProxyHostInput = {
   cpmForwardAuth?: CpmForwardAuthInput | null;
   redirects?: RedirectRule[] | null;
   rewrite?: RewriteConfig | null;
-  locationRules?: LocationRule[] | null;
+  locationRules?: LocationRuleInput[] | null;
+  pathAllows?: PathAllowRule[] | null;
+  pathBlocks?: PathBlockRule[] | null;
+  pathRewrites?: PathRewriteRule[] | null;
+  errorPages?: ErrorPageRule[] | null;
 };
 
 type ProxyHostRow = typeof proxyHosts.$inferSelect;
@@ -688,7 +822,7 @@ function serializeMeta(meta: ProxyHostMeta | null | undefined) {
   }
 
   if (meta.waf) {
-    normalized.waf = meta.waf;
+    normalized.waf = validateWafMeta(meta.waf);
   }
 
   if (meta.mtls) {
@@ -714,6 +848,25 @@ function serializeMeta(meta: ProxyHostMeta | null | undefined) {
 
   if (meta.location_rules && meta.location_rules.length > 0) {
     normalized.location_rules = meta.location_rules;
+  }
+
+  if (meta.path_allows && meta.path_allows.length > 0) {
+    normalized.path_allows = meta.path_allows;
+  }
+
+  if (meta.path_blocks && meta.path_blocks.length > 0) {
+    normalized.path_blocks = meta.path_blocks;
+  }
+
+  if (meta.path_rewrites && meta.path_rewrites.length > 0) {
+    normalized.path_rewrites = meta.path_rewrites;
+  }
+
+  if (meta.error_pages && meta.error_pages.length > 0) {
+    const errorPages = sanitizeErrorPageRules(meta.error_pages);
+    if (errorPages.length > 0) {
+      normalized.error_pages = errorPages;
+    }
   }
 
   return Object.keys(normalized).length > 0 ? JSON.stringify(normalized) : null;
@@ -745,25 +898,166 @@ function sanitizeRewriteConfig(value: unknown): RewriteConfig | null {
   return { path_prefix: prefix };
 }
 
-function sanitizeLocationRules(value: unknown): LocationRule[] {
+function sanitizePathAllows(value: unknown): PathAllowRule[] {
   if (!Array.isArray(value)) return [];
-  const valid: LocationRule[] = [];
+  const valid: PathAllowRule[] = [];
+  for (const item of value) {
+    if (item && typeof item === "object" && typeof item.path === "string" && item.path.trim()) {
+      // codeql[js/polynomial-redos] false positive: [^}]* is linear, no backtracking ambiguity
+      const path = item.path.trim().replace(/\{[^}]*\}/g, "");
+      if (path) {
+        valid.push({ path });
+      }
+    }
+  }
+  return valid;
+}
+
+function sanitizePathBlocks(value: unknown): PathBlockRule[] {
+  if (!Array.isArray(value)) return [];
+  const valid: PathBlockRule[] = [];
   for (const item of value) {
     if (
       item &&
       typeof item === "object" &&
       typeof item.path === "string" && item.path.trim() &&
-      Array.isArray(item.upstreams)
+      typeof item.status === "number" &&
+      (PATH_BLOCK_STATUS_CODES as readonly number[]).includes(item.status)
     ) {
-      const upstreams = (item.upstreams as unknown[])
-        .filter((u): u is string => typeof u === "string" && Boolean(u.trim()))
-        .map((u) => u.trim());
-      if (upstreams.length > 0) {
-        valid.push({ path: item.path.trim(), upstreams });
+      const rule: PathBlockRule = {
+        // codeql[js/polynomial-redos] false positive: [^}]* is linear, no backtracking ambiguity
+        path: item.path.trim().replace(/\{[^}]*\}/g, ""),
+        status: item.status as PathBlockStatusCode,
+      };
+      if (typeof item.body === "string" && item.body.length > 0) {
+        rule.body = item.body.slice(0, 4096);
+      }
+      if (rule.path) {
+        valid.push(rule);
       }
     }
   }
   return valid;
+}
+
+function sanitizePathRewrites(value: unknown): PathRewriteRule[] {
+  if (!Array.isArray(value)) return [];
+  const valid: PathRewriteRule[] = [];
+  for (const item of value) {
+    if (
+      item &&
+      typeof item === "object" &&
+      typeof item.from === "string" && item.from.trim() &&
+      typeof item.to === "string" && item.to.trim()
+    ) {
+      // codeql[js/polynomial-redos] false positive: [^}]* is linear, no backtracking ambiguity
+      const from = item.from.trim().replace(/\{[^}]*\}/g, "");
+      // codeql[js/polynomial-redos] false positive: [^}]* is linear, no backtracking ambiguity
+      const to = item.to.trim().replace(/\{[^}]*\}/g, "");
+      if (from && to) {
+        valid.push({ from, to });
+      }
+    }
+  }
+  return valid;
+}
+
+const ERROR_PAGE_BODY_MAX = 65536;
+const ERROR_PAGE_CONTENT_TYPE_MAX = 128;
+
+export function sanitizeErrorPageRules(value: unknown): ErrorPageRule[] {
+  if (!Array.isArray(value)) return [];
+  const valid: ErrorPageRule[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const body = typeof item.body === "string" ? item.body : "";
+    if (!body) continue; // a rule with no body would do nothing
+    const rawStatuses: unknown[] = Array.isArray(item.statuses) ? item.statuses : [];
+    const statuses = [...new Set(
+      rawStatuses.filter((s): s is number =>
+        typeof s === "number" && Number.isInteger(s) && s >= 400 && s <= 599)
+    )];
+    const rule: ErrorPageRule = { statuses, body: body.slice(0, ERROR_PAGE_BODY_MAX) };
+    if (typeof item.contentType === "string") {
+      // Strip CR/LF to prevent response header injection.
+      const ct = item.contentType.replace(/[\r\n]/g, "").trim().slice(0, ERROR_PAGE_CONTENT_TYPE_MAX);
+      if (ct) rule.contentType = ct;
+    }
+    valid.push(rule);
+  }
+  return valid;
+}
+
+// Extract a validated { path, upstreams } pair from a raw location-rule item,
+// or null if it is malformed. Shared by the meta and input sanitizers below.
+function parseLocationRuleBase(item: unknown): { path: string; upstreams: string[] } | null {
+  if (
+    item &&
+    typeof item === "object" &&
+    typeof (item as { path?: unknown }).path === "string" &&
+    (item as { path: string }).path.trim() &&
+    Array.isArray((item as { upstreams?: unknown }).upstreams)
+  ) {
+    const upstreams = ((item as { upstreams: unknown[] }).upstreams)
+      .filter((u): u is string => typeof u === "string" && Boolean(u.trim()))
+      .map((u) => u.trim());
+    if (upstreams.length > 0) {
+      return { path: (item as { path: string }).path.trim(), upstreams };
+    }
+  }
+  return null;
+}
+
+// Sanitize location rules read from stored meta (snake_case load_balancer).
+function sanitizeLocationRuleMetas(value: unknown): LocationRuleMeta[] {
+  if (!Array.isArray(value)) return [];
+  const valid: LocationRuleMeta[] = [];
+  for (const item of value) {
+    const base = parseLocationRuleBase(item);
+    if (!base) continue;
+    const rule: LocationRuleMeta = base;
+    const lb = sanitizeLoadBalancerMeta((item as { load_balancer?: LoadBalancerMeta }).load_balancer);
+    if (lb) rule.load_balancer = lb;
+    valid.push(rule);
+  }
+  return valid;
+}
+
+// Normalize location rules supplied as input (camelCase loadBalancer) into the
+// stored meta shape, reusing the host-level load-balancer input normalizer.
+function normalizeLocationRulesInput(value: unknown): LocationRuleMeta[] {
+  if (!Array.isArray(value)) return [];
+  const valid: LocationRuleMeta[] = [];
+  for (const item of value) {
+    const base = parseLocationRuleBase(item);
+    if (!base) continue;
+    const rule: LocationRuleMeta = base;
+    const lbInput = (item as { loadBalancer?: LoadBalancerInput | null }).loadBalancer;
+    const lb = normalizeLoadBalancerInput(lbInput ?? null, undefined);
+    if (lb) rule.load_balancer = lb;
+    valid.push(rule);
+  }
+  return valid;
+}
+
+function hydrateLocationRules(metaRules: LocationRuleMeta[] | undefined): LocationRule[] {
+  if (!metaRules) return [];
+  return metaRules.map((rule) => ({
+    path: rule.path,
+    upstreams: rule.upstreams,
+    loadBalancer: hydrateLoadBalancer(rule.load_balancer),
+  }));
+}
+
+// Convert hydrated location rules back to the stored meta shape. Used when
+// reconstructing existing meta during an update.
+function dehydrateLocationRules(rules: LocationRule[]): LocationRuleMeta[] {
+  return rules.map((rule) => {
+    const meta: LocationRuleMeta = { path: rule.path, upstreams: rule.upstreams };
+    const lb = dehydrateLoadBalancer(rule.loadBalancer);
+    if (lb) meta.load_balancer = lb;
+    return meta;
+  });
 }
 
 function parseMeta(value: string | null): ProxyHostMeta {
@@ -786,7 +1080,11 @@ function parseMeta(value: string | null): ProxyHostMeta {
       cpm_forward_auth: sanitizeCpmForwardAuthMeta(parsed.cpm_forward_auth),
       redirects: sanitizeRedirectRules(parsed.redirects),
       rewrite: sanitizeRewriteConfig(parsed.rewrite) ?? undefined,
-      location_rules: sanitizeLocationRules(parsed.location_rules),
+      location_rules: sanitizeLocationRuleMetas(parsed.location_rules),
+      path_allows: sanitizePathAllows(parsed.path_allows),
+      path_blocks: sanitizePathBlocks(parsed.path_blocks),
+      path_rewrites: sanitizePathRewrites(parsed.path_rewrites),
+      error_pages: sanitizeErrorPageRules(parsed.error_pages),
     };
   } catch (error) {
     console.warn("Failed to parse proxy host meta", error);
@@ -1258,7 +1556,7 @@ function buildMeta(existing: ProxyHostMeta, input: Partial<ProxyHostInput>): str
 
   if (input.waf !== undefined) {
     if (input.waf) {
-      next.waf = input.waf;
+      next.waf = validateWafMeta(input.waf);
     } else {
       delete next.waf;
     }
@@ -1309,11 +1607,47 @@ function buildMeta(existing: ProxyHostMeta, input: Partial<ProxyHostInput>): str
   }
 
   if (input.locationRules !== undefined) {
-    const rules = sanitizeLocationRules(input.locationRules ?? []);
+    const rules = normalizeLocationRulesInput(input.locationRules ?? []);
     if (rules.length > 0) {
       next.location_rules = rules;
     } else {
       delete next.location_rules;
+    }
+  }
+
+  if (input.pathAllows !== undefined) {
+    const rules = sanitizePathAllows(input.pathAllows ?? []);
+    if (rules.length > 0) {
+      next.path_allows = rules;
+    } else {
+      delete next.path_allows;
+    }
+  }
+
+  if (input.pathBlocks !== undefined) {
+    const rules = sanitizePathBlocks(input.pathBlocks ?? []);
+    if (rules.length > 0) {
+      next.path_blocks = rules;
+    } else {
+      delete next.path_blocks;
+    }
+  }
+
+  if (input.pathRewrites !== undefined) {
+    const rules = sanitizePathRewrites(input.pathRewrites ?? []);
+    if (rules.length > 0) {
+      next.path_rewrites = rules;
+    } else {
+      delete next.path_rewrites;
+    }
+  }
+
+  if (input.errorPages !== undefined) {
+    const rules = sanitizeErrorPageRules(input.errorPages ?? []);
+    if (rules.length > 0) {
+      next.error_pages = rules;
+    } else {
+      delete next.error_pages;
     }
   }
 
@@ -1655,7 +1989,11 @@ function parseProxyHost(row: ProxyHostRow): ProxyHost {
       : null,
     redirects: meta.redirects ?? [],
     rewrite: meta.rewrite ?? null,
-    locationRules: meta.location_rules ?? [],
+    locationRules: hydrateLocationRules(meta.location_rules),
+    pathAllows: meta.path_allows ?? [],
+    pathBlocks: meta.path_blocks ?? [],
+    pathRewrites: meta.path_rewrites ?? [],
+    errorPages: meta.error_pages ?? [],
   };
 }
 
@@ -1718,6 +2056,7 @@ export async function createProxyHost(input: ProxyHostInput, actorUserId: number
     throw new Error("At least one upstream must be specified");
   }
   input.upstreams.forEach(validateUpstreamProtocol);
+  await assertWildcardIssuable(domains, input.certificateId ?? null);
 
   const now = nowIso();
   const meta = buildMeta({}, input);
@@ -1773,12 +2112,14 @@ export async function updateProxyHost(id: number, input: Partial<ProxyHostInput>
     throw new Error("Proxy host not found");
   }
 
-  const domains = JSON.stringify(
-    input.domains ? normalizeProxyHostDomains(input.domains) : existing.domains
-  );
+  const domainList = input.domains ? normalizeProxyHostDomains(input.domains) : existing.domains;
+  const domains = JSON.stringify(domainList);
   if (input.upstreams) {
     input.upstreams.forEach(validateUpstreamProtocol);
   }
+  const effectiveCertificateId =
+    input.certificateId !== undefined ? input.certificateId : existing.certificateId;
+  await assertWildcardIssuable(domainList, effectiveCertificateId);
   const upstreams = input.upstreams ? JSON.stringify(Array.from(new Set(input.upstreams))) : JSON.stringify(existing.upstreams);
   const existingMeta: ProxyHostMeta = {
     custom_reverse_proxy_json: existing.customReverseProxyJson ?? undefined,
@@ -1800,7 +2141,11 @@ export async function updateProxyHost(id: number, input: Partial<ProxyHostInput>
     } : {}),
     ...(existing.redirects && existing.redirects.length > 0 ? { redirects: existing.redirects } : {}),
     ...(existing.rewrite ? { rewrite: existing.rewrite } : {}),
-    ...(existing.locationRules && existing.locationRules.length > 0 ? { location_rules: existing.locationRules } : {}),
+    ...(existing.locationRules && existing.locationRules.length > 0 ? { location_rules: dehydrateLocationRules(existing.locationRules) } : {}),
+    ...(existing.pathAllows && existing.pathAllows.length > 0 ? { path_allows: existing.pathAllows } : {}),
+    ...(existing.pathBlocks && existing.pathBlocks.length > 0 ? { path_blocks: existing.pathBlocks } : {}),
+    ...(existing.pathRewrites && existing.pathRewrites.length > 0 ? { path_rewrites: existing.pathRewrites } : {}),
+    ...(existing.errorPages && existing.errorPages.length > 0 ? { error_pages: existing.errorPages } : {}),
   };
   const meta = buildMeta(existingMeta, input);
 
@@ -1811,7 +2156,7 @@ export async function updateProxyHost(id: number, input: Partial<ProxyHostInput>
       name: input.name ?? existing.name,
       domains,
       upstreams,
-      certificateId: input.certificateId !== undefined ? input.certificateId : existing.certificateId,
+      certificateId: effectiveCertificateId,
       accessListId: input.accessListId !== undefined ? input.accessListId : existing.accessListId,
       sslForced: input.sslForced ?? existing.sslForced,
       hstsEnabled: input.hstsEnabled ?? existing.hstsEnabled,

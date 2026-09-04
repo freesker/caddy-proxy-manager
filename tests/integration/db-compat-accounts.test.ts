@@ -52,6 +52,119 @@ function createBrokenAccountsDatabase(dbPath: string) {
   sqlite.close();
 }
 
+function seedLegacyIssuerRows(dbPath: string) {
+  const sqlite = new Database(dbPath);
+  const now = new Date().toISOString();
+  const insertUser = sqlite.prepare(`
+    INSERT INTO users (
+      email, name, role, provider, subject, status, emailVerified, createdAt, updatedAt
+    ) VALUES (?, ?, 'user', ?, ?, 'active', 1, ?, ?)
+  `);
+  const credentialUser = insertUser.run(
+    'legacy-credential@example.com',
+    'Legacy Credential',
+    'credentials',
+    'legacy-credential',
+    now,
+    now
+  );
+  const oidcUser = insertUser.run(
+    'legacy-oidc@example.com',
+    'Legacy OIDC',
+    'oidc-provider',
+    'oidc-subject',
+    now,
+    now
+  );
+  const issuerlessUser = insertUser.run(
+    'legacy-issuerless@example.com',
+    'Legacy Issuerless',
+    'plain/provider',
+    'plain-subject',
+    now,
+    now
+  );
+
+  const insertProvider = sqlite.prepare(`
+    INSERT INTO oauth_providers (
+      id, name, type, clientId, clientSecret, issuer, scopes, autoLink,
+      enabled, source, createdAt, updatedAt
+    ) VALUES (?, ?, 'oidc', 'client-id', 'encrypted-secret', ?,
+      'openid email profile', 0, 1, 'ui', ?, ?)
+  `);
+  insertProvider.run(
+    'oidc-provider',
+    'OIDC Provider',
+    'https://issuer.example.com',
+    now,
+    now
+  );
+  insertProvider.run('plain/provider', 'Plain OAuth', null, now, now);
+
+  const insertAccount = sqlite.prepare(`
+    INSERT INTO accounts (
+      id, userId, accountId, providerId, password, createdAt, updatedAt
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+  insertAccount.run(
+    '101',
+    Number(credentialUser.lastInsertRowid),
+    String(credentialUser.lastInsertRowid),
+    'credential',
+    'legacy-password-hash',
+    now,
+    now
+  );
+  insertAccount.run(
+    '102',
+    Number(oidcUser.lastInsertRowid),
+    'oidc-subject',
+    'oidc-provider',
+    null,
+    now,
+    now
+  );
+  insertAccount.run(
+    '103',
+    Number(issuerlessUser.lastInsertRowid),
+    'plain-subject',
+    'plain/provider',
+    null,
+    now,
+    now
+  );
+  sqlite.close();
+}
+
+function seedLegacyIssuerCollision(dbPath: string) {
+  const sqlite = new Database(dbPath);
+  const now = new Date().toISOString();
+  const insertUser = sqlite.prepare(`
+    INSERT INTO users (
+      email, name, role, provider, subject, status, emailVerified, createdAt, updatedAt
+    ) VALUES (?, ?, 'user', ?, 'shared-subject', 'active', 1, ?, ?)
+  `);
+  const firstUser = insertUser.run('first@example.com', 'First', 'alias-a', now, now);
+  const secondUser = insertUser.run('second@example.com', 'Second', 'alias-b', now, now);
+  const insertProvider = sqlite.prepare(`
+    INSERT INTO oauth_providers (
+      id, name, type, clientId, clientSecret, issuer, scopes, autoLink,
+      enabled, source, createdAt, updatedAt
+    ) VALUES (?, ?, 'oidc', 'client-id', 'encrypted-secret',
+      'https://shared-issuer.example.com', 'openid email profile', 0, 1, 'ui', ?, ?)
+  `);
+  insertProvider.run('alias-a', 'Alias A', now, now);
+  insertProvider.run('alias-b', 'Alias B', now, now);
+  const insertAccount = sqlite.prepare(`
+    INSERT INTO accounts (
+      id, userId, accountId, providerId, createdAt, updatedAt
+    ) VALUES (?, ?, 'shared-subject', ?, ?, ?)
+  `);
+  insertAccount.run('201', Number(firstUser.lastInsertRowid), 'alias-a', now, now);
+  insertAccount.run('202', Number(secondUser.lastInsertRowid), 'alias-b', now, now);
+  sqlite.close();
+}
+
 describe('database compatibility for accounts schema', () => {
   afterEach(() => {
     process.env.DATABASE_URL = ':memory:';
@@ -93,9 +206,10 @@ describe('database compatibility for accounts schema', () => {
       expect(user?.id).toBeDefined();
 
       const account = sqlite.prepare(
-        'SELECT id, providerId, accountId, password FROM accounts WHERE userId = ? AND providerId = ?'
+        'SELECT id, issuer, providerId, accountId, password FROM accounts WHERE userId = ? AND providerId = ?'
       ).get(user!.id, 'credential') as {
         id: number;
+        issuer: string;
         providerId: string;
         accountId: string;
         password: string | null;
@@ -103,11 +217,68 @@ describe('database compatibility for accounts schema', () => {
 
       expect(account).toBeDefined();
       expect(account?.id).toBeGreaterThan(0);
+      expect(account?.issuer).toBe('local:credential');
       expect(account?.providerId).toBe('credential');
       expect(account?.accountId).toBe(String(user!.id));
       expect(account?.password).toBe('hash123');
 
       sqlite.close();
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('backfills stable credential, configured-OIDC, and issuerless OAuth namespaces', async () => {
+    const tempDir = mkdtempSync(join(process.cwd(), 'tmp-db-issuer-'));
+    const dbPath = join(tempDir, 'issuer.db');
+
+    try {
+      createBrokenAccountsDatabase(dbPath);
+      seedLegacyIssuerRows(dbPath);
+
+      process.env.DATABASE_URL = `file:${dbPath}`;
+      resetDbModuleState();
+      await import('@/src/lib/db');
+
+      const sqlite = new Database(dbPath, { readonly: true });
+      const rows = sqlite.prepare(
+        'SELECT providerId, issuer FROM accounts ORDER BY providerId'
+      ).all() as Array<{ providerId: string; issuer: string }>;
+      expect(rows).toEqual([
+        { providerId: 'credential', issuer: 'local:credential' },
+        { providerId: 'oidc-provider', issuer: 'https://issuer.example.com' },
+        { providerId: 'plain/provider', issuer: 'local:oauth:plain%2Fprovider' },
+      ]);
+
+      const issuerColumn = (sqlite.prepare('PRAGMA table_info("accounts")').all() as Array<{
+        name: string;
+        notnull: number;
+      }>).find((column) => column.name === 'issuer');
+      expect(issuerColumn?.notnull).toBe(1);
+
+      const indexColumns = sqlite.prepare(
+        'PRAGMA index_info("accounts_issuer_account_idx")'
+      ).all() as Array<{ name: string; seqno: number }>;
+      expect(indexColumns.sort((a, b) => a.seqno - b.seqno).map((column) => column.name))
+        .toEqual(['issuer', 'accountId']);
+      sqlite.close();
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses to merge colliding legacy identities during issuer backfill', async () => {
+    const tempDir = mkdtempSync(join(process.cwd(), 'tmp-db-issuer-collision-'));
+    const dbPath = join(tempDir, 'collision.db');
+
+    try {
+      createBrokenAccountsDatabase(dbPath);
+      seedLegacyIssuerCollision(dbPath);
+
+      process.env.DATABASE_URL = `file:${dbPath}`;
+      resetDbModuleState();
+
+      await expect(import('@/src/lib/db')).rejects.toThrow(/account identity collision/);
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }

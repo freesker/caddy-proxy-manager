@@ -53,8 +53,10 @@ import { POST as createProxyHost } from '../../app/api/v1/proxy-hosts/route';
 import { POST as createL4ProxyHost } from '../../app/api/v1/l4-proxy-hosts/route';
 import { POST as createCertificate } from '../../app/api/v1/certificates/route';
 import { POST as createCaCertificate } from '../../app/api/v1/ca-certificates/route';
-import { spec } from '../../app/api/v1/openapi.json/route';
+import { GET as getOpenApi } from '../../app/api/v1/openapi.json/route';
 import * as schema from '../../src/lib/db/schema';
+import { getCertificate, migrateLegacyCertificateStorage } from '../../src/lib/models/certificates';
+import { decryptSecret, isEncryptedSecret } from '../../src/lib/secret';
 
 function mockRequest(body: unknown): any {
   return {
@@ -71,6 +73,7 @@ beforeEach(async () => {
     schema.l4ProxyHosts,
     schema.certificates,
     schema.caCertificates,
+    schema.settings,
     schema.users,
   ]) {
     await ctx.db.delete(table).catch(() => {});
@@ -111,17 +114,24 @@ describe('v1 OpenAPI schemas: no top-level snake_case', () => {
     'TokenInput.expires_at',
   ]);
 
-  const schemas = (spec as any).components.schemas as Record<string, any>;
+  it('uses camelCase for every top-level resource property', async () => {
+    const response = await getOpenApi(mockRequest(undefined));
+    const spec = await response.json() as any;
+    const schemas = spec.components.schemas as Record<string, any>;
+    const offenders: string[] = [];
 
-  for (const [schemaName, schemaDef] of Object.entries(schemas)) {
-    if (META_SHAPED_SCHEMAS.has(schemaName)) continue;
-    if (typeof schemaDef !== 'object' || !schemaDef?.properties) continue;
-    const offenders = Object.keys(schemaDef.properties)
-      .filter((k) => k.includes('_') && !LEGACY_SNAKE_KEYS.has(`${schemaName}.${k}`));
-    it(`${schemaName} uses camelCase top-level keys`, () => {
-      expect(offenders).toEqual([]);
-    });
-  }
+    for (const [schemaName, schemaDef] of Object.entries(schemas)) {
+      if (META_SHAPED_SCHEMAS.has(schemaName)) continue;
+      if (typeof schemaDef !== 'object' || !schemaDef?.properties) continue;
+      for (const key of Object.keys(schemaDef.properties)) {
+        if (key.includes('_') && !LEGACY_SNAKE_KEYS.has(`${schemaName}.${key}`)) {
+          offenders.push(`${schemaName}.${key}`);
+        }
+      }
+    }
+
+    expect(offenders).toEqual([]);
+  });
 });
 
 describe('v1 API contract: camelCase round-trip', () => {
@@ -176,6 +186,33 @@ describe('v1 API contract: camelCase round-trip', () => {
     expect(data.geoblock.block_countries).toEqual(['CN']);
   });
 
+  it('POST /api/v1/proxy-hosts returns a safe 400 for mTLS without trust material', async () => {
+    const response = await createProxyHost(mockRequest({
+      name: 'No Trust Host',
+      domains: ['no-trust.example.com'],
+      upstreams: ['10.0.0.1:8080'],
+      mtls: { enabled: true },
+    }));
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      error: expect.stringMatching(/no trusted client certificates, roles, or CA/i),
+    });
+  });
+
+  it('POST /api/v1/proxy-hosts returns a safe 400 for a wildcard without DNS credentials', async () => {
+    const response = await createProxyHost(mockRequest({
+      name: 'Wildcard Without DNS',
+      domains: ['*.example.com'],
+      upstreams: ['10.0.0.1:8080'],
+    }));
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      error: expect.stringMatching(/requires a DNS provider/i),
+    });
+  });
+
   it('POST /api/v1/l4-proxy-hosts uses listenAddress (string) and matcherValue (array)', async () => {
     const payload = {
       name: 'L4 Contract',
@@ -228,6 +265,83 @@ describe('v1 API contract: camelCase round-trip', () => {
     const data = await response.json();
     expect(data.domainNames).toEqual(['contract-cert.example.com']);
     expect(data.autoRenew).toBe(false);
+  });
+
+  it('POST /api/v1/certificates persists an imported key but never returns it', async () => {
+    const privateKeyPem = '-----BEGIN PRIVATE KEY-----\nmultiline\nprivate-key-sentinel\n-----END PRIVATE KEY-----';
+    const payload = {
+      name: 'Write-only imported key',
+      type: 'imported',
+      domainNames: ['write-only.example.com'],
+      autoRenew: false,
+      certificatePem: '-----BEGIN CERTIFICATE-----\npublic-data\n-----END CERTIFICATE-----',
+      privateKeyPem,
+    };
+
+    const response = await createCertificate(mockRequest(payload));
+    const bodyText = await response.text();
+    const data = JSON.parse(bodyText);
+    const stored = await ctx.db.query.certificates.findFirst({
+      where: (table, { eq }) => eq(table.id, data.id),
+    });
+
+    expect(response.status).toBe(201);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(data.hasPrivateKey).toBe(true);
+    expect(data.privateKeyPem).toBeUndefined();
+    expect(bodyText).not.toContain(privateKeyPem);
+    expect(bodyText).not.toContain('private-key-sentinel');
+    expect(stored?.privateKeyPem).toBeDefined();
+    expect(isEncryptedSecret(stored!.privateKeyPem!)).toBe(true);
+    expect(decryptSecret(stored!.privateKeyPem!)).toBe(privateKeyPem);
+  });
+
+  it('migrates legacy plaintext certificate keys without changing operational reads', async () => {
+    const privateKeyPem = '-----BEGIN PRIVATE KEY-----\nlegacy-key-sentinel\n-----END PRIVATE KEY-----';
+    const now = new Date().toISOString();
+    const [row] = await ctx.db.insert(schema.certificates).values({
+      name: 'Legacy imported key',
+      type: 'imported',
+      domainNames: JSON.stringify(['legacy.example.com']),
+      autoRenew: false,
+      certificatePem: '-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----',
+      privateKeyPem,
+      createdAt: now,
+      updatedAt: now,
+    }).returning();
+
+    await expect(migrateLegacyCertificateStorage()).resolves.toBe(1);
+    await expect(migrateLegacyCertificateStorage()).resolves.toBe(0);
+
+    const stored = await ctx.db.query.certificates.findFirst({
+      where: (table, { eq }) => eq(table.id, row.id),
+    });
+    expect(isEncryptedSecret(stored!.privateKeyPem!)).toBe(true);
+    expect((await getCertificate(row.id))?.privateKeyPem).toBe(privateKeyPem);
+  });
+
+  it('scrubs legacy certificate provider secrets from storage', async () => {
+    const providerSecret = 'legacy-provider-option-secret-sentinel';
+    const now = new Date().toISOString();
+    const [row] = await ctx.db.insert(schema.certificates).values({
+      name: 'Legacy managed certificate',
+      type: 'managed',
+      domainNames: JSON.stringify(['managed.example.com']),
+      autoRenew: true,
+      providerOptions: JSON.stringify({ provider: 'cloudflare', api_token: providerSecret }),
+      createdAt: now,
+      updatedAt: now,
+    }).returning();
+
+    await expect(migrateLegacyCertificateStorage()).resolves.toBe(1);
+    await expect(migrateLegacyCertificateStorage()).resolves.toBe(0);
+
+    const stored = await ctx.db.query.certificates.findFirst({
+      where: (table, { eq }) => eq(table.id, row.id),
+    });
+    expect(stored?.providerOptions).toBe('{"provider":"cloudflare"}');
+    expect(stored?.providerOptions).not.toContain(providerSecret);
+    expect((await getCertificate(row.id))?.providerOptions).toEqual({ provider: 'cloudflare' });
   });
 
   it('POST /api/v1/ca-certificates persists certificatePem and hasPrivateKey', async () => {

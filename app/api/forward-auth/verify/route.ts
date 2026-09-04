@@ -1,7 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import { validateForwardAuthSession, checkHostAccessByDomain } from "@/src/lib/models/forward-auth";
+import {
+  validateForwardAuthSession,
+  checkHostAccess,
+  resolveForwardAuthAudience,
+} from "@/src/lib/models/forward-auth";
 import { getUserById } from "@/src/lib/models/user";
 import { getGroupsForUser } from "@/src/lib/models/groups";
+import { getTrustedForwardAuthOrigin } from "@/src/lib/forward-auth-trust";
 
 const COOKIE_NAME = "_cpm_fa";
 
@@ -30,12 +35,22 @@ function toHeaderValue(value: string): string {
  */
 export async function GET(request: NextRequest) {
   try {
+    // Never trust X-Forwarded-* from a client reaching Next.js directly.  Only
+    // generated Caddy routes know the purpose-derived proof value.
+    const requestOrigin = getTrustedForwardAuthOrigin(request.headers);
+    const audience = requestOrigin
+      ? await resolveForwardAuthAudience(requestOrigin)
+      : null;
+    if (!audience) {
+      return new NextResponse(null, { status: 401 });
+    }
+
     const token = request.cookies.get(COOKIE_NAME)?.value;
     if (!token) {
       return new NextResponse(null, { status: 401 });
     }
 
-    const session = await validateForwardAuthSession(token);
+    const session = await validateForwardAuthSession(token, audience);
     if (!session) {
       return new NextResponse(null, { status: 401 });
     }
@@ -45,13 +60,7 @@ export async function GET(request: NextRequest) {
       return new NextResponse(null, { status: 401 });
     }
 
-    // Check host access using X-Forwarded-Host header set by Caddy
-    const forwardedHost = request.headers.get("x-forwarded-host") ?? request.headers.get("host") ?? "";
-    if (!forwardedHost) {
-      return new NextResponse(null, { status: 401 });
-    }
-
-    const { hasAccess } = await checkHostAccessByDomain(session.userId, forwardedHost);
+    const hasAccess = await checkHostAccess(session.userId, audience.proxyHostId);
     if (!hasAccess) {
       return new NextResponse("Forbidden", { status: 403 });
     }

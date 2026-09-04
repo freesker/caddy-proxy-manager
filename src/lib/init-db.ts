@@ -3,6 +3,7 @@ import db, { nowIso } from "./db";
 import { config } from "./config";
 import { users, accounts } from "./db/schema";
 import { and, eq } from "drizzle-orm";
+import { CREDENTIAL_ACCOUNT_ISSUER } from "./account-issuer";
 
 /**
  * Ensures the admin user from environment variables exists in the database.
@@ -79,7 +80,11 @@ export async function ensureAdminUser(): Promise<void> {
 async function ensureCredentialAccount(userId: number, passwordHash: string): Promise<void> {
   const now = nowIso();
   const existing = await db.select().from(accounts).where(
-    and(eq(accounts.userId, userId), eq(accounts.providerId, "credential"))
+    and(
+      eq(accounts.userId, userId),
+      eq(accounts.providerId, "credential"),
+      eq(accounts.issuer, CREDENTIAL_ACCOUNT_ISSUER)
+    )
   ).get();
 
   if (existing) {
@@ -91,6 +96,7 @@ async function ensureCredentialAccount(userId: number, passwordHash: string): Pr
   } else {
     await db.insert(accounts).values({
       userId,
+      issuer: CREDENTIAL_ACCOUNT_ISSUER,
       accountId: userId.toString(),
       providerId: "credential",
       password: passwordHash,

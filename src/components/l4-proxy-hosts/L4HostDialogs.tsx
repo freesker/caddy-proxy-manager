@@ -1,6 +1,6 @@
 "use client";
 
-import { useActionState, useEffect, useState } from "react";
+import { useActionState, useEffect, useRef, useState } from "react";
 import {
   createL4ProxyHostAction,
   deleteL4ProxyHostAction,
@@ -30,6 +30,23 @@ import {
 } from "@/components/ui/accordion";
 import { cn } from "@/lib/utils";
 import { Globe, Layers, MapPin, Pin } from "lucide-react";
+
+/**
+ * Schedule onClose after a successful action exactly once. Without the ref
+ * guard the effect re-arms on every parent render (onClose is a new function
+ * identity each render) while status stays "success", producing stray onClose
+ * calls that can close a dialog the user has just reopened (#241).
+ */
+function useCloseOnSuccess(state: { status: string }, onClose: () => void) {
+  const scheduledRef = useRef(false);
+  useEffect(() => {
+    if (state.status === "success" && !scheduledRef.current) {
+      scheduledRef.current = true;
+      const timer = setTimeout(onClose, 1000);
+      return () => clearTimeout(timer);
+    }
+  }, [state.status, onClose]);
+}
 
 function FormField({
   label,
@@ -815,11 +832,7 @@ export function CreateL4HostDialog({
     INITIAL_ACTION_STATE
   );
 
-  useEffect(() => {
-    if (state.status === "success") {
-      setTimeout(onClose, 1000);
-    }
-  }, [state.status, onClose]);
+  useCloseOnSuccess(state, onClose);
 
   return (
     <AppDialog
@@ -860,11 +873,7 @@ export function EditL4HostDialog({
     INITIAL_ACTION_STATE
   );
 
-  useEffect(() => {
-    if (state.status === "success") {
-      setTimeout(onClose, 1000);
-    }
-  }, [state.status, onClose]);
+  useCloseOnSuccess(state, onClose);
 
   return (
     <AppDialog
@@ -903,11 +912,7 @@ export function DeleteL4HostDialog({
     INITIAL_ACTION_STATE
   );
 
-  useEffect(() => {
-    if (state.status === "success") {
-      setTimeout(onClose, 1000);
-    }
-  }, [state.status, onClose]);
+  useCloseOnSuccess(state, onClose);
 
   return (
     <AppDialog

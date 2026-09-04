@@ -5,10 +5,54 @@ import {
   decryptProviderCredentials,
   encryptProviderCredentials,
   getProviderDefinition,
+  redactDnsProviderSettingsForApi,
+  redactLegacyCloudflareSettingsForApi,
 } from "@/src/lib/dns-providers";
 import { isEncryptedSecret } from "@/src/lib/secret";
 
 describe("DNS provider registry", () => {
+  it("redacts every credential value from API status metadata", () => {
+    const status = redactDnsProviderSettingsForApi({
+      providers: {
+        acmedns: {
+          username: "credential-username",
+          password: "credential-password",
+          server_url: "https://credential-host.invalid",
+          empty_optional: "",
+        },
+      },
+      default: "acmedns",
+    });
+    const serialized = JSON.stringify(status);
+
+    expect(status).toEqual({
+      providers: {
+        acmedns: {
+          configuredFields: ["password", "server_url", "username"],
+        },
+      },
+      default: "acmedns",
+    });
+    expect(serialized).not.toContain("credential-username");
+    expect(serialized).not.toContain("credential-password");
+    expect(serialized).not.toContain("credential-host");
+  });
+
+  it("redacts the legacy Cloudflare API token while retaining identifiers", () => {
+    const status = redactLegacyCloudflareSettingsForApi({
+      apiToken: "legacy-token-sentinel",
+      zoneId: "zone-id",
+      accountId: "account-id",
+    });
+
+    expect(status).toEqual({
+      hasApiToken: true,
+      zoneId: "zone-id",
+      accountId: "account-id",
+    });
+    expect(JSON.stringify(status)).not.toContain("legacy-token-sentinel");
+  });
+
   it("registers Njalla with the Caddy module path and API token field", () => {
     const provider = getProviderDefinition("njalla");
 
@@ -47,6 +91,161 @@ describe("DNS provider registry", () => {
     });
   });
 
+  it("registers Spaceship with the Caddy module path and API key/secret fields", () => {
+    const provider = getProviderDefinition("spaceship");
+
+    expect(provider).toMatchObject({
+      name: "spaceship",
+      displayName: "Spaceship",
+      docsUrl: "https://github.com/caddy-dns/spaceship",
+      modulePath: "github.com/caddy-dns/spaceship",
+    });
+    expect(provider?.fields).toEqual([
+      { key: "api_key", label: "API Key", type: "password", required: true },
+      { key: "api_secret", label: "API Secret", type: "password", required: true },
+    ]);
+    expect(DNS_PROVIDERS.map((p) => p.name)).toContain("spaceship");
+  });
+
+  it("encrypts, decrypts, and emits Spaceship credentials for Caddy DNS challenges", () => {
+    const encrypted = encryptProviderCredentials("spaceship", {
+      api_key: "spaceship-key",
+      api_secret: "spaceship-secret",
+    });
+
+    expect(isEncryptedSecret(encrypted.api_key)).toBe(true);
+    expect(isEncryptedSecret(encrypted.api_secret)).toBe(true);
+    expect(decryptProviderCredentials("spaceship", encrypted)).toEqual({
+      api_key: "spaceship-key",
+      api_secret: "spaceship-secret",
+    });
+    expect(buildDnsChallengeConfig("spaceship", encrypted, ["1.1.1.1"])).toEqual({
+      provider: {
+        name: "spaceship",
+        api_key: "spaceship-key",
+        api_secret: "spaceship-secret",
+      },
+      resolvers: ["1.1.1.1"],
+    });
+  });
+
+  it("registers deSEC with the Caddy module path and API token field", () => {
+    const provider = getProviderDefinition("desec");
+
+    expect(provider).toMatchObject({
+      name: "desec",
+      displayName: "deSEC",
+      docsUrl: "https://github.com/caddy-dns/desec",
+      modulePath: "github.com/caddy-dns/desec",
+    });
+    expect(provider?.fields).toEqual([
+      { key: "token", label: "API Token", type: "password", required: true },
+    ]);
+    expect(DNS_PROVIDERS.map((p) => p.name)).toContain("desec");
+  });
+
+  it("encrypts, decrypts, and emits deSEC credentials for Caddy DNS challenges", () => {
+    const encrypted = encryptProviderCredentials("desec", {
+      token: "desec-token",
+    });
+
+    expect(isEncryptedSecret(encrypted.token)).toBe(true);
+    expect(decryptProviderCredentials("desec", encrypted)).toEqual({
+      token: "desec-token",
+    });
+    expect(buildDnsChallengeConfig("desec", encrypted, ["1.1.1.1"])).toEqual({
+      provider: {
+        name: "desec",
+        token: "desec-token",
+      },
+      resolvers: ["1.1.1.1"],
+    });
+  });
+
+  it("registers Dynu with the Caddy module path and API token field", () => {
+    const provider = getProviderDefinition("dynu");
+
+    expect(provider).toMatchObject({
+      name: "dynu",
+      displayName: "Dynu",
+      docsUrl: "https://github.com/caddy-dns/dynu",
+      modulePath: "github.com/caddy-dns/dynu",
+    });
+    expect(provider?.fields).toEqual([
+      { key: "api_token", label: "API Token", type: "password", required: true },
+    ]);
+    expect(DNS_PROVIDERS.map((p) => p.name)).toContain("dynu");
+  });
+
+  it("encrypts, decrypts, and emits Dynu credentials for Caddy DNS challenges", () => {
+    const encrypted = encryptProviderCredentials("dynu", {
+      api_token: "dynu-token",
+    });
+
+    expect(isEncryptedSecret(encrypted.api_token)).toBe(true);
+    expect(decryptProviderCredentials("dynu", encrypted)).toEqual({
+      api_token: "dynu-token",
+    });
+    expect(buildDnsChallengeConfig("dynu", encrypted, ["1.1.1.1"])).toEqual({
+      provider: {
+        name: "dynu",
+        api_token: "dynu-token",
+      },
+      resolvers: ["1.1.1.1"],
+    });
+  });
+
+  it("registers acme-dns with the Caddy module path and account fields", () => {
+    const provider = getProviderDefinition("acmedns");
+
+    expect(provider).toMatchObject({
+      name: "acmedns",
+      displayName: "acme-dns",
+      docsUrl: "https://github.com/caddy-dns/acmedns",
+      modulePath: "github.com/caddy-dns/acmedns",
+    });
+    expect(provider?.fields).toEqual([
+      { key: "username", label: "Username", type: "string", required: true },
+      { key: "password", label: "Password", type: "password", required: true },
+      { key: "subdomain", label: "Subdomain", type: "string", required: true },
+      {
+        key: "server_url",
+        label: "Server URL",
+        type: "string",
+        required: true,
+        placeholder: "https://auth.acme-dns.io",
+      },
+    ]);
+    expect(DNS_PROVIDERS.map((p) => p.name)).toContain("acmedns");
+  });
+
+  it("encrypts, decrypts, and emits acme-dns credentials for Caddy DNS challenges", () => {
+    const encrypted = encryptProviderCredentials("acmedns", {
+      username: "acmedns-user",
+      password: "acmedns-pass",
+      subdomain: "acmedns-subdomain",
+      server_url: "https://auth.acme-dns.io",
+    });
+
+    expect(isEncryptedSecret(encrypted.password)).toBe(true);
+    expect(decryptProviderCredentials("acmedns", encrypted)).toEqual({
+      username: "acmedns-user",
+      password: "acmedns-pass",
+      subdomain: "acmedns-subdomain",
+      server_url: "https://auth.acme-dns.io",
+    });
+    expect(buildDnsChallengeConfig("acmedns", encrypted, ["1.1.1.1"])).toEqual({
+      provider: {
+        name: "acmedns",
+        username: "acmedns-user",
+        password: "acmedns-pass",
+        subdomain: "acmedns-subdomain",
+        server_url: "https://auth.acme-dns.io",
+      },
+      resolvers: ["1.1.1.1"],
+    });
+  });
+
   it("registers Infomaniak with the Caddy module path and API token field", () => {
     const provider = getProviderDefinition("infomaniak");
 
@@ -57,12 +256,7 @@ describe("DNS provider registry", () => {
       modulePath: "github.com/caddy-dns/infomaniak",
     });
     expect(provider?.fields).toEqual([
-      {
-        key: "api_token",
-        label: "API Token",
-        type: "password",
-        required: true,
-      },
+      { key: "api_token", label: "API Token", type: "password", required: true },
     ]);
     expect(DNS_PROVIDERS.map((p) => p.name)).toContain("infomaniak");
   });
@@ -82,6 +276,122 @@ describe("DNS provider registry", () => {
         api_token: "infomaniak-token",
       },
       resolvers: ["1.1.1.1"],
+    });
+  });
+
+  it("registers netcup with the Caddy module path and customer/key/password fields", () => {
+    const provider = getProviderDefinition("netcup");
+
+    expect(provider).toMatchObject({
+      name: "netcup",
+      displayName: "netcup",
+      docsUrl: "https://github.com/caddy-dns/netcup",
+      modulePath: "github.com/caddy-dns/netcup",
+    });
+    expect(provider?.fields).toEqual([
+      { key: "customer_number", label: "Customer Number", type: "string", required: true },
+      { key: "api_key", label: "API Key", type: "password", required: true },
+      { key: "api_password", label: "API Password", type: "password", required: true },
+    ]);
+    expect(DNS_PROVIDERS.map((p) => p.name)).toContain("netcup");
+  });
+
+  it("encrypts, decrypts, and emits netcup credentials for Caddy DNS challenges", () => {
+    const encrypted = encryptProviderCredentials("netcup", {
+      customer_number: "123456",
+      api_key: "netcup-key",
+      api_password: "netcup-password",
+    });
+
+    expect(isEncryptedSecret(encrypted.api_key)).toBe(true);
+    expect(isEncryptedSecret(encrypted.api_password)).toBe(true);
+    expect(isEncryptedSecret(encrypted.customer_number)).toBe(false);
+    expect(decryptProviderCredentials("netcup", encrypted)).toEqual({
+      customer_number: "123456",
+      api_key: "netcup-key",
+      api_password: "netcup-password",
+    });
+    expect(buildDnsChallengeConfig("netcup", encrypted, ["1.1.1.1"])).toEqual({
+      provider: {
+        name: "netcup",
+        customer_number: "123456",
+        api_key: "netcup-key",
+        api_password: "netcup-password",
+      },
+      resolvers: ["1.1.1.1"],
+    });
+  });
+
+  it("registers ClouDNS with the Caddy module path and auth-id/sub-user/password fields", () => {
+    const provider = getProviderDefinition("cloudns");
+
+    expect(provider).toMatchObject({
+      name: "cloudns",
+      displayName: "ClouDNS",
+      docsUrl: "https://github.com/caddy-dns/cloudns",
+      modulePath: "github.com/caddy-dns/cloudns",
+    });
+    expect(provider?.fields).toEqual([
+      {
+        key: "auth_id",
+        label: "Auth ID",
+        type: "string",
+        required: false,
+        placeholder: "1234",
+        description: "API user ID (created under API & Resellers). Required unless a sub-user ID is provided.",
+      },
+      {
+        key: "sub_auth_id",
+        label: "Sub-user ID",
+        type: "string",
+        required: false,
+        description: "API sub-user ID. Required unless an API user ID is provided.",
+      },
+      {
+        key: "auth_password",
+        label: "API Password",
+        type: "password",
+        required: true,
+        description: "Password of the API user or sub-user.",
+      },
+    ]);
+    expect(DNS_PROVIDERS.map((p) => p.name)).toContain("cloudns");
+  });
+
+  it("encrypts, decrypts, and emits ClouDNS credentials for Caddy DNS challenges", () => {
+    const encrypted = encryptProviderCredentials("cloudns", {
+      auth_id: "1234",
+      auth_password: "cloudns-password",
+    });
+
+    expect(isEncryptedSecret(encrypted.auth_password)).toBe(true);
+    expect(isEncryptedSecret(encrypted.auth_id)).toBe(false);
+    expect(decryptProviderCredentials("cloudns", encrypted)).toEqual({
+      auth_id: "1234",
+      auth_password: "cloudns-password",
+    });
+    expect(buildDnsChallengeConfig("cloudns", encrypted, ["1.1.1.1"])).toEqual({
+      provider: {
+        name: "cloudns",
+        auth_id: "1234",
+        auth_password: "cloudns-password",
+      },
+      resolvers: ["1.1.1.1"],
+    });
+  });
+
+  it("emits ClouDNS sub-user credentials when no API user ID is configured", () => {
+    const encrypted = encryptProviderCredentials("cloudns", {
+      sub_auth_id: "5678",
+      auth_password: "cloudns-password",
+    });
+
+    expect(buildDnsChallengeConfig("cloudns", encrypted, [])).toEqual({
+      provider: {
+        name: "cloudns",
+        sub_auth_id: "5678",
+        auth_password: "cloudns-password",
+      },
     });
   });
 });

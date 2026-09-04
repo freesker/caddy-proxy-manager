@@ -1,15 +1,20 @@
-import { createReadStream, existsSync, statSync } from 'node:fs';
-import { createInterface } from 'node:readline';
+import { existsSync, statSync, truncateSync } from 'node:fs';
 import maxmind, { CountryResponse } from 'maxmind';
 import db from './db';
 import { wafLogParseState } from './db/schema';
 import { eq } from 'drizzle-orm';
 import { insertWafEvents, type WafEventRow } from './clickhouse/client';
+import { readLines } from './log-read';
 
 const AUDIT_LOG = '/logs/waf-audit.log';
 const RULES_LOG = '/logs/waf-rules.log';
 const GEOIP_DB = '/usr/share/GeoIP/GeoLite2-Country.mmdb';
 const BATCH_SIZE = 200;
+// Coraza's SecAuditLog writes directly to AUDIT_LOG with no rotation of its
+// own (unlike access.log/waf-rules.log, which go through Caddy's file writer
+// and roll automatically). Once fully ingested, truncate it in place past
+// this size so it can't grow unbounded and fill the disk.
+const AUDIT_LOG_TRUNCATE_THRESHOLD = 100 * 1024 * 1024;
 
 let geoReader: Awaited<ReturnType<typeof maxmind.open<CountryResponse>>> | null = null;
 const geoCache = new Map<string, string | null>();
@@ -70,44 +75,45 @@ export function extractBracketField(msg: string, field: string): string | null {
   return m ? m[1] : null;
 }
 
+// Anomaly-evaluation rules are not specific attacks — they only report the
+// accumulated score, so they must never be picked as an event's rule.
+function isAnomalyEvaluationRule(ruleId: number | null): boolean {
+  return ruleId === 949110 || ruleId === 980130;
+}
+
+/** Build RuleInfo from a ModSecurity-format rule string, or null if it isn't a specific attack rule. */
+export function ruleInfoFromMessage(msg: string): RuleInfo | null {
+  const ruleIdStr = extractBracketField(msg, 'id');
+  const ruleId = ruleIdStr ? parseInt(ruleIdStr, 10) : null;
+  if (isAnomalyEvaluationRule(ruleId)) return null;
+  return {
+    ruleId,
+    ruleMessage: extractBracketField(msg, 'msg'),
+    severity: extractBracketField(msg, 'severity'),
+  };
+}
+
 async function readRulesLog(startOffset: number): Promise<{ ruleMap: Map<string, RuleInfo>; newOffset: number }> {
-  return new Promise((resolve, reject) => {
-    const ruleMap = new Map<string, RuleInfo>();
-    let bytesRead = 0;
+  const ruleMap = new Map<string, RuleInfo>();
+  const { lines, newOffset } = await readLines(startOffset, RULES_LOG);
 
-    const stream = createReadStream(RULES_LOG, { start: startOffset, encoding: 'utf8' });
-    stream.on('error', (err: NodeJS.ErrnoException) => {
-      if (err.code === 'ENOENT' || err.code === 'EACCES') resolve({ ruleMap, newOffset: startOffset });
-      else reject(err);
-    });
+  for (const line of lines) {
+    try {
+      const entry = JSON.parse(line) as { msg?: string };
+      const msg = entry.msg ?? '';
+      const uniqueId = extractBracketField(msg, 'unique_id');
+      if (!uniqueId) continue;
+      // Keep only the first detection rule per unique_id
+      if (ruleMap.has(uniqueId)) continue;
+      const info = ruleInfoFromMessage(msg);
+      if (!info) continue;
+      ruleMap.set(uniqueId, info);
+    } catch {
+      // skip malformed lines
+    }
+  }
 
-    const rl = createInterface({ input: stream, crlfDelay: Infinity });
-    rl.on('line', (line) => {
-      bytesRead += Buffer.byteLength(line, 'utf8') + 1;
-      if (!line.trim()) return;
-      try {
-        const entry = JSON.parse(line) as { msg?: string };
-        const msg = entry.msg ?? '';
-        const uniqueId = extractBracketField(msg, 'unique_id');
-        if (!uniqueId) return;
-        // Keep only the first detection rule per unique_id (skip anomaly evaluation rules)
-        if (ruleMap.has(uniqueId)) return;
-        const ruleIdStr = extractBracketField(msg, 'id');
-        const ruleId = ruleIdStr ? parseInt(ruleIdStr, 10) : null;
-        // Skip anomaly evaluation rule (949110 / 980130) — not a specific attack rule
-        if (ruleId === 949110 || ruleId === 980130) return;
-        ruleMap.set(uniqueId, {
-          ruleId,
-          ruleMessage: extractBracketField(msg, 'msg'),
-          severity: extractBracketField(msg, 'severity'),
-        });
-      } catch {
-        // skip malformed lines
-      }
-    });
-    rl.on('close', () => resolve({ ruleMap, newOffset: startOffset + bytesRead }));
-    rl.on('error', reject);
-  });
+  return { ruleMap, newOffset };
 }
 
 // ── audit log parsing ─────────────────────────────────────────────────────────
@@ -128,6 +134,33 @@ interface CorazaAuditEntry {
       headers?: Record<string, string[]>;
     };
   };
+  // Populated when audit log part H (or K) is enabled: one entry per matched
+  // rule, carrying the ModSecurity-format rule string.
+  messages?: { message?: string; error_message?: string }[];
+}
+
+/**
+ * Extract the first specific (non anomaly-evaluation) matched rule from a
+ * Coraza audit entry's own `messages` array.
+ *
+ * Coraza populates `messages[].error_message` with the same ModSecurity-format
+ * string that Caddy's http.handlers.waf logger writes to waf-rules.log, as long
+ * as audit log part H is enabled (buildWafHandler sets `SecAuditLogParts ABFHZ`).
+ * Reading it from the audit entry itself is what makes rule attribution
+ * deterministic: joining against waf-rules.log only works when both files
+ * happen to be written within the same parse tick, and silently loses the rule
+ * — and therefore the whole event — whenever they aren't.
+ */
+export function ruleInfoFromAuditEntry(entry: CorazaAuditEntry): RuleInfo | null {
+  for (const m of entry.messages ?? []) {
+    const msg = m.error_message || m.message || '';
+    if (!msg) continue;
+    const info = ruleInfoFromMessage(msg);
+    // Keep looking past anomaly-evaluation rules — a real attack rule usually
+    // precedes them, but ordering is not guaranteed.
+    if (info && info.ruleId !== null) return info;
+  }
+  return null;
 }
 
 export function parseLine(line: string, ruleMap: Map<string, RuleInfo>): WafEventRow | null {
@@ -160,8 +193,9 @@ export function parseLine(line: string, ruleMap: Map<string, RuleInfo>): WafEven
   const hostArr = req.headers?.['host'] ?? req.headers?.['Host'];
   const host = Array.isArray(hostArr) ? (hostArr[0] ?? '') : (hostArr ?? '');
 
-  // Look up rule info from the WAF rules log via the transaction unique_id
-  const ruleInfo = tx.id ? ruleMap.get(tx.id) : undefined;
+  // Prefer the rule carried by the audit entry itself; fall back to the
+  // waf-rules.log join only for Coraza builds that don't populate `messages`.
+  const ruleInfo = ruleInfoFromAuditEntry(entry) ?? (tx.id ? ruleMap.get(tx.id) : undefined);
 
   const blocked = tx.is_interrupted ?? false;
 
@@ -185,25 +219,28 @@ export function parseLine(line: string, ruleMap: Map<string, RuleInfo>): WafEven
 }
 
 async function readAuditLog(startOffset: number): Promise<{ lines: string[]; newOffset: number }> {
-  return new Promise((resolve, reject) => {
-    const lines: string[] = [];
-    let bytesRead = 0;
-
-    const stream = createReadStream(AUDIT_LOG, { start: startOffset, encoding: 'utf8' });
-    stream.on('error', (err: NodeJS.ErrnoException) => {
-      if (err.code === 'ENOENT' || err.code === 'EACCES') resolve({ lines: [], newOffset: startOffset });
-      else reject(err);
-    });
-
-    const rl = createInterface({ input: stream, crlfDelay: Infinity });
-    rl.on('line', (line) => {
-      bytesRead += Buffer.byteLength(line, 'utf8') + 1;
-      if (line.trim()) lines.push(line.trim());
-    });
-    rl.on('close', () => resolve({ lines, newOffset: startOffset + bytesRead }));
-    rl.on('error', reject);
-  });
+  return readLines(startOffset, AUDIT_LOG);
 }
+
+/**
+ * Reset the stored audit-log position so the next pass starts from the top.
+ *
+ * Used whenever the file we were tracking is gone or has been replaced: a
+ * stored offset that belongs to a different (or deleted) inode would otherwise
+ * park the parser past the end of the new file forever, since the rotation
+ * guard only fires when the file is *smaller* than the last recorded size.
+ */
+function resetAuditLogState(): void {
+  setState('waf_audit_log_offset', '0');
+  setState('waf_audit_log_size', '0');
+  setState('waf_audit_log_inode', '0');
+}
+
+// Only warn once per episode so a deleted audit log — or one we're never going
+// to be allowed to truncate — doesn't spam a line every 30s, while still
+// surfacing the condition instead of failing silently the way this used to.
+let warnedAuditLogMissing = false;
+let warnedTruncateFailed = false;
 
 async function insertBatch(rows: WafEventRow[]): Promise<void> {
   for (let i = 0; i < rows.length; i += BATCH_SIZE) {
@@ -220,7 +257,21 @@ export async function initWafLogParser(): Promise<void> {
 
 export async function parseNewWafLogEntries(): Promise<void> {
   if (stopped) return;
-  if (!existsSync(AUDIT_LOG)) return;
+
+  // Coraza holds the audit log open, so if the file is deleted it keeps writing
+  // to the now-unlinked inode and never recreates it. Returning silently here
+  // (as this used to) leaves WAF ingestion permanently dead with no trace in
+  // the logs — surface it, and clear the stale offset so a recreated file is
+  // read from the start.
+  if (!existsSync(AUDIT_LOG)) {
+    if (!warnedAuditLogMissing) {
+      console.warn(`[waf-log-parser] ${AUDIT_LOG} is missing — WAF events cannot be ingested until Caddy recreates it (restart the caddy container).`);
+      warnedAuditLogMissing = true;
+      resetAuditLogState();
+    }
+    return;
+  }
+  warnedAuditLogMissing = false;
 
   try {
     // ── 1. Parse WAF rules log to build unique_id → rule info map ────────────
@@ -240,15 +291,28 @@ export async function parseNewWafLogEntries(): Promise<void> {
     // ── 2. Parse audit log, enriching events with rule info from map ─────────
     const storedOffset = parseInt(getState('waf_audit_log_offset') ?? '0', 10);
     const storedSize = parseInt(getState('waf_audit_log_size') ?? '0', 10);
+    const storedInode = parseInt(getState('waf_audit_log_inode') ?? '0', 10);
 
     let currentSize: number;
+    let currentInode: number;
     try {
-      currentSize = statSync(AUDIT_LOG).size;
+      const st = statSync(AUDIT_LOG);
+      currentSize = st.size;
+      currentInode = Number(st.ino);
     } catch {
       return;
     }
 
-    const startOffset = currentSize < storedSize ? 0 : storedOffset;
+    // Restart from the top when the file was rotated (shrank) or replaced by a
+    // different inode. Size alone is not enough: a delete-and-recreate that has
+    // already grown past the last recorded size would otherwise leave the
+    // stored offset stranded beyond EOF with no way back.
+    const replaced = storedInode !== 0 && currentInode !== storedInode;
+    const startOffset = currentSize < storedSize || replaced ? 0 : storedOffset;
+    if (replaced) {
+      console.warn('[waf-log-parser] waf-audit.log was replaced (new inode) — re-reading from the start');
+    }
+
     const { lines, newOffset } = await readAuditLog(startOffset);
 
     if (lines.length > 0) {
@@ -259,8 +323,37 @@ export async function parseNewWafLogEntries(): Promise<void> {
       }
     }
 
+    // Persist progress BEFORE attempting truncation. Truncation is a best-effort
+    // disk-space guard that fails with EACCES whenever web and caddy run as
+    // different UIDs (Coraza creates the file owned by caddy), and doing it
+    // first meant that failure aborted the pass and froze these offsets — so
+    // every later pass re-read and re-inserted the same tail forever.
     setState('waf_audit_log_offset', String(newOffset));
     setState('waf_audit_log_size', String(currentSize));
+    setState('waf_audit_log_inode', String(currentInode));
+
+    // Once we've read through to the current end of file, it's safe to
+    // truncate: Coraza appends via O_APPEND, so writes after truncation land
+    // correctly at the new (empty) end of file.
+    if (newOffset === currentSize && currentSize > AUDIT_LOG_TRUNCATE_THRESHOLD) {
+      try {
+        truncateSync(AUDIT_LOG, 0);
+        // Same inode, now empty — keep tracking it, just rewind.
+        setState('waf_audit_log_offset', '0');
+        setState('waf_audit_log_size', '0');
+        warnedTruncateFailed = false;
+        console.log(`[waf-log-parser] truncated waf-audit.log after ingesting ${currentSize} bytes`);
+      } catch (err) {
+        if (!warnedTruncateFailed) {
+          const code = (err as NodeJS.ErrnoException).code;
+          console.warn(
+            `[waf-log-parser] could not truncate ${AUDIT_LOG} (${code ?? err}); ` +
+            `it will keep growing. Ingestion is unaffected.`
+          );
+          warnedTruncateFailed = true;
+        }
+      }
+    }
   } catch (err) {
     console.error('[waf-log-parser] error during parse:', err);
   }

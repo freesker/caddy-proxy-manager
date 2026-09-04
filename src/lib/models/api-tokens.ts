@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import db, { nowIso, toIso } from "../db";
 import { apiTokens } from "../db/schema";
-import { count, eq } from "drizzle-orm";
+import { and, count, eq } from "drizzle-orm";
 import { NotFoundError } from "../api-auth";
 
 export type ApiToken = {
@@ -102,27 +102,26 @@ export async function listAllApiTokens(): Promise<ApiToken[]> {
   return rows.map(toApiToken);
 }
 
-export async function deleteApiToken(id: number, userId: number): Promise<void> {
-  // Check ownership — fetch the token first
-  const token = await db.query.apiTokens.findFirst({
-    where: (table, { eq }) => eq(table.id, id),
-  });
+export async function deleteApiToken(
+  id: number,
+  userId: number,
+  canDeleteAny = false
+): Promise<void> {
+  // Keep inaccessible and nonexistent IDs indistinguishable. Authorization is
+  // part of the DELETE predicate, so a non-owner cannot use status codes to
+  // enumerate another user's token IDs.
+  const deleted = await db
+    .delete(apiTokens)
+    .where(
+      canDeleteAny
+        ? eq(apiTokens.id, id)
+        : and(eq(apiTokens.id, id), eq(apiTokens.createdBy, userId))
+    )
+    .returning({ id: apiTokens.id });
 
-  if (!token) {
+  if (deleted.length === 0) {
     throw new NotFoundError("Token not found");
   }
-
-  // Check if the user owns the token or is an admin
-  if (token.createdBy !== userId) {
-    const user = await db.query.users.findFirst({
-      where: (table, { eq }) => eq(table.id, userId),
-    });
-    if (!user || user.role !== "admin") {
-      throw new Error("Forbidden");
-    }
-  }
-
-  await db.delete(apiTokens).where(eq(apiTokens.id, id));
 }
 
 const LAST_USED_DEBOUNCE_MS = 60_000; // 60 seconds

@@ -2,9 +2,9 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter, usePathname, useSearchParams } from "next/navigation";
-import { Globe, MoreHorizontal, ArrowRight, Shield, Bug, MapPin, Scale, KeyRound, UserCheck, CornerRightDown, Replace, FileUp } from "lucide-react";
+import { Globe, MoreHorizontal, ArrowRight, Shield, Bug, MapPin, Scale, KeyRound, UserCheck, CornerRightDown, Replace, FileUp, Ban, GitBranch, ShieldCheck, LogIn } from "lucide-react";
 import type { AccessList } from "@/lib/models/access-lists";
-import type { Certificate } from "@/lib/models/certificates";
+import type { CertificatePickerOption } from "@/lib/certificate-api";
 import type { ProxyHost } from "@/lib/models/proxy-hosts";
 import type { CaCertificate } from "@/lib/models/ca-certificates";
 import type { AuthentikSettings } from "@/lib/settings";
@@ -35,7 +35,7 @@ type ForwardAuthAccessMap = Record<number, { userIds: number[]; groupIds: number
 
 type Props = {
   hosts: ProxyHost[];
-  certificates: Certificate[];
+  certificates: CertificatePickerOption[];
   accessLists: AccessList[];
   caCertificates: CaCertificate[];
   authentikDefaults: AuthentikSettings | null;
@@ -148,6 +148,11 @@ export default function ProxyHostsClient({ hosts, certificates, accessLists, caC
               <UserCheck className="h-2.5 w-2.5 mr-0.5" />Authentik
             </Badge>
           ),
+          host.cpmForwardAuth?.enabled && (
+            <Badge key="forward-auth" variant="secondary" className="text-[10px] px-1.5 py-0">
+              <LogIn className="h-2.5 w-2.5 mr-0.5" />Forward Auth
+            </Badge>
+          ),
           host.waf?.enabled && (
             <Badge key="waf" variant="secondary" className="text-[10px] px-1.5 py-0">
               <Bug className="h-2.5 w-2.5 mr-0.5" />WAF
@@ -176,6 +181,21 @@ export default function ProxyHostsClient({ hosts, certificates, accessLists, caC
           host.rewrite && (
             <Badge key="rewrite" variant="secondary" className="text-[10px] px-1.5 py-0">
               <Replace className="h-2.5 w-2.5 mr-0.5" />Rewrite
+            </Badge>
+          ),
+          host.pathAllows?.length > 0 && (
+            <Badge key="path-allows" variant="secondary" className="text-[10px] px-1.5 py-0">
+              <ShieldCheck className="h-2.5 w-2.5 mr-0.5" />Allows
+            </Badge>
+          ),
+          host.pathBlocks?.length > 0 && (
+            <Badge key="path-blocks" variant="secondary" className="text-[10px] px-1.5 py-0">
+              <Ban className="h-2.5 w-2.5 mr-0.5" />Blocks
+            </Badge>
+          ),
+          host.pathRewrites?.length > 0 && (
+            <Badge key="path-rewrites" variant="secondary" className="text-[10px] px-1.5 py-0">
+              <GitBranch className="h-2.5 w-2.5 mr-0.5" />Path Rewrites
             </Badge>
           ),
         ].filter(Boolean);
@@ -333,6 +353,7 @@ export default function ProxyHostsClient({ hosts, certificates, accessLists, caC
           onClose={() => setEditHost(null)}
           certificates={certificates}
           accessLists={accessLists}
+          authentikDefaults={authentikDefaults}
           caCertificates={caCertificates}
           mtlsRoles={mtlsRoles ?? []}
           issuedClientCerts={issuedClientCerts ?? []}

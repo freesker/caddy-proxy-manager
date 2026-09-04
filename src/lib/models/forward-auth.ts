@@ -9,6 +9,7 @@ import {
   groupMembers,
 } from "../db/schema";
 import { and, eq, gt, inArray, lt } from "drizzle-orm";
+import { hostMatchesPattern } from "../host-pattern-priority";
 
 const DEFAULT_SESSION_TTL = 7 * 24 * 60 * 60; // 7 days in seconds
 const EXCHANGE_CODE_TTL = 60; // 60 seconds
@@ -18,23 +19,44 @@ function hashToken(raw: string): string {
   return createHash("sha256").update(raw).digest("hex");
 }
 
+export type ForwardAuthAudience = {
+  /** Exact normalized external origin: scheme + hostname + non-default port. */
+  origin: string;
+  /** Hostname without a port, used only for display/audit messages. */
+  hostname: string;
+  /** The concrete proxy-host record which authorized the wildcard/exact host. */
+  proxyHostId: number;
+};
+
+function parseForwardAuthUrl(rawUrl: string): URL | null {
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    if (parsed.username || parsed.password) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function audienceMatchesUrl(audience: ForwardAuthAudience, parsed: URL): boolean {
+  return (
+    Number.isInteger(audience.proxyHostId) &&
+    audience.proxyHostId > 0 &&
+    audience.origin === parsed.origin &&
+    audience.hostname === parsed.hostname.toLowerCase()
+  );
+}
+
 // ── Redirect Intents ────────────────────────────────────────────────
 // Store redirect URIs server-side so the client only holds an opaque ID.
 
 export async function createRedirectIntent(redirectUri: string): Promise<string> {
-  // Validate redirect URI to prevent open redirects
-  let parsed: URL;
-  try {
-    parsed = new URL(redirectUri);
-  } catch {
-    throw new Error("Invalid redirect URI");
-  }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new Error("Redirect URI must use http or https scheme");
-  }
-  if (parsed.username || parsed.password) {
-    throw new Error("Redirect URI must not contain credentials");
-  }
+  // Resolve and persist the concrete target now.  In particular, a wildcard
+  // match is reduced to the exact origin the browser will visit and the one
+  // proxy-host record that authorized it.
+  const audience = await resolveForwardAuthAudience(redirectUri);
+  if (!audience) throw new Error("Redirect URI is not a forward-auth target");
 
   const rid = randomBytes(16).toString("hex");
   const ridHash = hashToken(rid);
@@ -43,6 +65,8 @@ export async function createRedirectIntent(redirectUri: string): Promise<string>
 
   await db.insert(forwardAuthRedirectIntents).values({
     ridHash,
+    proxyHostId: audience.proxyHostId,
+    audienceOrigin: audience.origin,
     redirectUri,
     expiresAt,
     consumed: false,
@@ -59,7 +83,10 @@ export async function createRedirectIntent(redirectUri: string): Promise<string>
 
 export async function consumeRedirectIntent(
   rid: string
-): Promise<string | null> {
+): Promise<{
+  redirectUri: string;
+  audience: ForwardAuthAudience;
+} | null> {
   const ridHash = hashToken(rid);
   const now = nowIso();
 
@@ -78,14 +105,34 @@ export async function consumeRedirectIntent(
 
   if (claimed.length === 0) return null;
 
-  const redirectUri = claimed[0].redirectUri;
+  const intent = claimed[0];
 
   // Delete immediately after consumption
   await db
     .delete(forwardAuthRedirectIntents)
-    .where(eq(forwardAuthRedirectIntents.id, claimed[0].id));
+    .where(eq(forwardAuthRedirectIntents.id, intent.id));
 
-  return redirectUri;
+  const parsed = parseForwardAuthUrl(intent.redirectUri);
+  if (!parsed || !intent.audienceOrigin || !intent.proxyHostId) return null;
+
+  const audience: ForwardAuthAudience = {
+    origin: intent.audienceOrigin,
+    hostname: parsed.hostname.toLowerCase(),
+    proxyHostId: intent.proxyHostId,
+  };
+  if (!audienceMatchesUrl(audience, parsed)) return null;
+
+  // Fail closed if the proxy-host mapping changed between creation and use.
+  const currentAudience = await resolveForwardAuthAudience(intent.redirectUri);
+  if (
+    !currentAudience ||
+    currentAudience.origin !== audience.origin ||
+    currentAudience.proxyHostId !== audience.proxyHostId
+  ) {
+    return null;
+  }
+
+  return { redirectUri: intent.redirectUri, audience };
 }
 
 // ── Sessions ─────────────────────────────────────────────────────────
@@ -93,14 +140,22 @@ export async function consumeRedirectIntent(
 export type ForwardAuthSession = {
   id: number;
   userId: number;
+  proxyHostId: number;
+  audienceOrigin: string;
   expiresAt: string;
   createdAt: string;
 };
 
 export async function createForwardAuthSession(
   userId: number,
+  audience: ForwardAuthAudience,
   ttlSeconds?: number
 ): Promise<{ rawToken: string; session: ForwardAuthSession }> {
+  const parsedAudience = parseForwardAuthUrl(audience.origin);
+  if (!parsedAudience || !audienceMatchesUrl(audience, parsedAudience)) {
+    throw new Error("Invalid forward-auth audience");
+  }
+
   const rawToken = randomBytes(32).toString("hex");
   const tokenHash = hashToken(rawToken);
   const now = nowIso();
@@ -109,7 +164,14 @@ export async function createForwardAuthSession(
 
   const [row] = await db
     .insert(forwardAuthSessions)
-    .values({ userId, tokenHash, expiresAt, createdAt: now })
+    .values({
+      userId,
+      proxyHostId: audience.proxyHostId,
+      audienceOrigin: audience.origin,
+      tokenHash,
+      expiresAt,
+      createdAt: now,
+    })
     .returning();
 
   if (!row) throw new Error("Failed to create forward auth session");
@@ -119,6 +181,8 @@ export async function createForwardAuthSession(
     session: {
       id: row.id,
       userId: row.userId,
+      proxyHostId: row.proxyHostId,
+      audienceOrigin: row.audienceOrigin,
       expiresAt: toIso(row.expiresAt)!,
       createdAt: toIso(row.createdAt)!
     }
@@ -126,7 +190,8 @@ export async function createForwardAuthSession(
 }
 
 export async function validateForwardAuthSession(
-  rawToken: string
+  rawToken: string,
+  audience: ForwardAuthAudience,
 ): Promise<{ sessionId: number; userId: number } | null> {
   const tokenHash = hashToken(rawToken);
   const session = await db.query.forwardAuthSessions.findFirst({
@@ -135,6 +200,12 @@ export async function validateForwardAuthSession(
 
   if (!session) return null;
   if (new Date(session.expiresAt) <= new Date()) return null;
+  if (
+    session.proxyHostId !== audience.proxyHostId ||
+    session.audienceOrigin !== audience.origin
+  ) {
+    return null;
+  }
 
   return { sessionId: session.id, userId: session.userId };
 }
@@ -146,6 +217,8 @@ export async function listForwardAuthSessions(): Promise<ForwardAuthSession[]> {
   return rows.map((r) => ({
     id: r.id,
     userId: r.userId,
+    proxyHostId: r.proxyHostId,
+    audienceOrigin: r.audienceOrigin,
     expiresAt: toIso(r.expiresAt)!,
     createdAt: toIso(r.createdAt)!
   }));
@@ -165,8 +238,25 @@ export async function deleteUserForwardAuthSessions(userId: number): Promise<voi
 
 export async function createExchangeCode(
   sessionId: number,
-  redirectUri: string
+  redirectUri: string,
+  audience: ForwardAuthAudience,
 ): Promise<{ rawCode: string }> {
+  const parsedRedirect = parseForwardAuthUrl(redirectUri);
+  if (!parsedRedirect || !audienceMatchesUrl(audience, parsedRedirect)) {
+    throw new Error("Invalid forward-auth audience");
+  }
+
+  const session = await db.query.forwardAuthSessions.findFirst({
+    where: (table, operators) => operators.eq(table.id, sessionId)
+  });
+  if (
+    !session ||
+    session.proxyHostId !== audience.proxyHostId ||
+    session.audienceOrigin !== audience.origin
+  ) {
+    throw new Error("Forward-auth session audience mismatch");
+  }
+
   const rawCode = randomBytes(32).toString("hex");
   const codeHash = hashToken(rawCode);
   const now = nowIso();
@@ -174,6 +264,8 @@ export async function createExchangeCode(
 
   await db.insert(forwardAuthExchanges).values({
     sessionId,
+    proxyHostId: audience.proxyHostId,
+    audienceOrigin: audience.origin,
     codeHash,
     sessionToken: "[pending]", // placeholder — fresh token generated at redemption
     redirectUri,
@@ -186,7 +278,8 @@ export async function createExchangeCode(
 }
 
 export async function redeemExchangeCode(
-  rawCode: string
+  rawCode: string,
+  audience: ForwardAuthAudience,
 ): Promise<{ sessionId: number; redirectUri: string; rawSessionToken: string } | null> {
   const codeHash = hashToken(rawCode);
   const now = nowIso();
@@ -198,6 +291,8 @@ export async function redeemExchangeCode(
     .where(
       and(
         eq(forwardAuthExchanges.codeHash, codeHash),
+        eq(forwardAuthExchanges.proxyHostId, audience.proxyHostId),
+        eq(forwardAuthExchanges.audienceOrigin, audience.origin),
         eq(forwardAuthExchanges.used, false),
         gt(forwardAuthExchanges.expiresAt, now)
       )
@@ -207,19 +302,37 @@ export async function redeemExchangeCode(
   if (claimed.length === 0) return null;
   const exchange = claimed[0];
 
+  const parsedRedirect = parseForwardAuthUrl(exchange.redirectUri);
+  if (!parsedRedirect || !audienceMatchesUrl(audience, parsedRedirect)) {
+    await db
+      .delete(forwardAuthExchanges)
+      .where(eq(forwardAuthExchanges.id, exchange.id));
+    return null;
+  }
+
   // Generate a fresh session token (never stored in the exchange table)
   const rawToken = randomBytes(32).toString("hex");
   const tokenHash = hashToken(rawToken);
 
-  await db
+  const updatedSessions = await db
     .update(forwardAuthSessions)
     .set({ tokenHash })
-    .where(eq(forwardAuthSessions.id, exchange.sessionId));
+    .where(
+      and(
+        eq(forwardAuthSessions.id, exchange.sessionId),
+        eq(forwardAuthSessions.proxyHostId, audience.proxyHostId),
+        eq(forwardAuthSessions.audienceOrigin, audience.origin),
+        gt(forwardAuthSessions.expiresAt, now),
+      )
+    )
+    .returning({ id: forwardAuthSessions.id });
 
   // Delete the redeemed exchange immediately
   await db
     .delete(forwardAuthExchanges)
     .where(eq(forwardAuthExchanges.id, exchange.id));
+
+  if (updatedSessions.length === 0) return null;
 
   return {
     sessionId: exchange.sessionId,
@@ -286,6 +399,9 @@ export async function checkHostAccessByDomain(
     where: (table, operators) => operators.eq(table.enabled, true)
   });
 
+  // Exact-match hosts take precedence over wildcard-covered ones, mirroring
+  // how Caddy itself prioritizes routes (see host-pattern-priority.ts).
+  let wildcardMatch: (typeof allHosts)[number] | null = null;
   for (const ph of allHosts) {
     let parsed: string[];
     try {
@@ -297,6 +413,14 @@ export async function checkHostAccessByDomain(
       const hasAccess = await checkHostAccess(userId, ph.id);
       return { hasAccess, proxyHostId: ph.id };
     }
+    if (!wildcardMatch && parsed.some((d) => hostMatchesPattern(host, d))) {
+      wildcardMatch = ph;
+    }
+  }
+
+  if (wildcardMatch) {
+    const hasAccess = await checkHostAccess(userId, wildcardMatch.id);
+    return { hasAccess, proxyHostId: wildcardMatch.id };
   }
 
   // Host not found in any proxy host — deny by default
@@ -362,10 +486,28 @@ export async function setForwardAuthAccess(
 
 // ── Domain Validation ────────────────────────────────────────────────
 
-export async function isForwardAuthDomain(host: string): Promise<boolean> {
+function hasForwardAuthEnabled(ph: { meta: string | null }): boolean {
+  let parsedMeta: Record<string, unknown>;
+  try {
+    parsedMeta = ph.meta ? JSON.parse(ph.meta) : {};
+  } catch {
+    return false;
+  }
+  const fa = parsedMeta.cpm_forward_auth as Record<string, unknown> | undefined;
+  return !!fa?.enabled;
+}
+
+async function findForwardAuthProxyHost(host: string) {
   const allHosts = await db.query.proxyHosts.findMany({
     where: (table, operators) => operators.eq(table.enabled, true)
   });
+
+  // Exact-match hosts take precedence over wildcard-covered ones: if an
+  // explicit host exists for this domain, its own forward-auth setting
+  // decides the outcome and the wildcard host is never consulted — this
+  // mirrors the routing precedence Caddy itself applies.
+  let exactMatchFound = false;
+  let wildcardMatch: (typeof allHosts)[number] | null = null;
 
   for (const ph of allHosts) {
     let parsed: string[];
@@ -375,18 +517,45 @@ export async function isForwardAuthDomain(host: string): Promise<boolean> {
       continue;
     }
     if (parsed.some((d) => d.toLowerCase() === host.toLowerCase())) {
-      // Check that this host actually has forward auth enabled
-      let parsedMeta: Record<string, unknown>;
-      try {
-        parsedMeta = ph.meta ? JSON.parse(ph.meta) : {};
-      } catch {
-        continue;
-      }
-      const fa = parsedMeta.cpm_forward_auth as Record<string, unknown> | undefined;
-      if (fa?.enabled) return true;
+      exactMatchFound = true;
+      if (hasForwardAuthEnabled(ph)) return ph;
+      continue;
+    }
+    if (!wildcardMatch && parsed.some((d) => hostMatchesPattern(host, d))) {
+      wildcardMatch = ph;
     }
   }
-  return false;
+
+  if (!exactMatchFound && wildcardMatch) {
+    return hasForwardAuthEnabled(wildcardMatch) ? wildcardMatch : null;
+  }
+
+  return null;
+}
+
+/**
+ * Resolve a URL to one exact forward-auth audience.  Wildcard proxy hosts are
+ * supported, but the resulting audience always contains the concrete origin
+ * visited by the browser, never the wildcard pattern itself.
+ */
+export async function resolveForwardAuthAudience(
+  targetUrl: string,
+): Promise<ForwardAuthAudience | null> {
+  const parsed = parseForwardAuthUrl(targetUrl);
+  if (!parsed) return null;
+
+  const proxyHost = await findForwardAuthProxyHost(parsed.hostname);
+  if (!proxyHost) return null;
+
+  return {
+    origin: parsed.origin,
+    hostname: parsed.hostname.toLowerCase(),
+    proxyHostId: proxyHost.id,
+  };
+}
+
+export async function isForwardAuthDomain(host: string): Promise<boolean> {
+  return !!(await findForwardAuthProxyHost(host));
 }
 
 // ── Cleanup ──────────────────────────────────────────────────────────

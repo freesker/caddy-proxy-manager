@@ -77,31 +77,42 @@ test.describe('Certificates', () => {
     const headers = { 'Content-Type': 'application/json', 'Origin': BASE_URL };
     const domain = `acme-wc-${Date.now()}.example`;
 
-    // 1. Create a proxy host with wildcard domain (no certificate → ACME auto)
-    const wcHostRes = await page.request.post(`${API}/proxy-hosts`, {
-      data: {
-        name: `Wildcard ${domain}`,
-        domains: [`*.${domain}`],
-        upstreams: ['127.0.0.1:8080'],
-      },
+    // Auto-managed wildcard hosts require a DNS provider (ACME DNS-01 challenge).
+    // Configure one for this isolated test stack and clear it afterwards.
+    const dnsProviderUrl = `${API}/settings/dns-provider`;
+    const setDnsRes = await page.request.put(dnsProviderUrl, {
+      data: { providers: { duckdns: { api_token: 'e2e-fake-token' } }, default: 'duckdns' },
       headers,
     });
-    expect(wcHostRes.status()).toBe(201);
-    const wcHost = await wcHostRes.json();
+    expect(setDnsRes.ok()).toBeTruthy();
 
-    // 2. Create a proxy host for a subdomain (also no certificate → ACME auto)
-    const subHostRes = await page.request.post(`${API}/proxy-hosts`, {
-      data: {
-        name: `Sub ${domain}`,
-        domains: [`sub.${domain}`],
-        upstreams: ['127.0.0.1:8080'],
-      },
-      headers,
-    });
-    expect(subHostRes.status()).toBe(201);
-    const subHost = await subHostRes.json();
-
+    let wcHostId: number | undefined;
+    let subHostId: number | undefined;
     try {
+      // 1. Create a proxy host with wildcard domain (no certificate → ACME auto)
+      const wcHostRes = await page.request.post(`${API}/proxy-hosts`, {
+        data: {
+          name: `Wildcard ${domain}`,
+          domains: [`*.${domain}`],
+          upstreams: ['127.0.0.1:8080'],
+        },
+        headers,
+      });
+      expect(wcHostRes.status()).toBe(201);
+      wcHostId = (await wcHostRes.json()).id;
+
+      // 2. Create a proxy host for a subdomain (also no certificate → ACME auto)
+      const subHostRes = await page.request.post(`${API}/proxy-hosts`, {
+        data: {
+          name: `Sub ${domain}`,
+          domains: [`sub.${domain}`],
+          upstreams: ['127.0.0.1:8080'],
+        },
+        headers,
+      });
+      expect(subHostRes.status()).toBe(201);
+      subHostId = (await subHostRes.json()).id;
+
       // 3. Visit certificates page — subdomain should be collapsed under the wildcard
       await page.goto('/certificates');
       await expect(page.getByRole('tab', { name: /acme/i })).toBeVisible();
@@ -114,8 +125,12 @@ test.describe('Certificates', () => {
       // The subdomain host should NOT appear as a separate entry
       await expect(acmeTab.getByText(`sub.${domain}`)).not.toBeVisible({ timeout: 5_000 });
     } finally {
-      await page.request.delete(`${API}/proxy-hosts/${subHost.id}`, { headers });
-      await page.request.delete(`${API}/proxy-hosts/${wcHost.id}`, { headers });
+      if (subHostId) await page.request.delete(`${API}/proxy-hosts/${subHostId}`, { headers });
+      if (wcHostId) await page.request.delete(`${API}/proxy-hosts/${wcHostId}`, { headers });
+      await page.request.put(dnsProviderUrl, {
+        data: { providers: {}, default: null },
+        headers,
+      });
     }
   });
 
@@ -155,7 +170,10 @@ test.describe('Certificates', () => {
       await dialog.getByRole('button', { name: /delete certificate/i }).click();
 
       await expect(dialog).not.toBeVisible({ timeout: 10_000 });
-      await expect(page.getByText(certName)).not.toBeVisible({ timeout: 10_000 });
+      // toHaveCount(0), not not.toBeVisible(): the row is rendered twice
+      // (hidden mobile card + desktop row) and a strict visibility assertion
+      // fails transiently while the post-delete revalidation is in flight.
+      await expect(page.getByText(certName)).toHaveCount(0, { timeout: 10_000 });
 
       const getRes = await page.request.get(`${API}/certificates/${cert.id}`, { headers: { Origin: BASE_URL } });
       expect(getRes.status()).toBe(404);
@@ -164,13 +182,16 @@ test.describe('Certificates', () => {
     }
   });
 
-  test('imports a certificate via the UI form preserving PEM newlines (#157)', async ({ page }) => {
+  test('imports a multiline private key without exposing it through the API (#157)', async ({ page }) => {
     const BASE_URL = 'http://localhost:3000';
     const API = `${BASE_URL}/api/v1`;
     const headers = { 'Content-Type': 'application/json', 'Origin': BASE_URL };
     const domain = `import-ui-${Date.now()}.example`;
     const certName = `UI Import ${domain}`;
     const { certificatePem, privateKeyPem } = createSelfSignedServerCertificate(domain, [domain]);
+    // HTML textareas normalize CRLF input to LF. Compare against the browser's
+    // canonical value while still checking that every PEM line survives.
+    const normalizedPrivateKeyPem = privateKeyPem.replace(/\r\n?/g, '\n');
 
     // Sanity-check the fixture: PEM blocks must be multi-line for this test
     // to meaningfully exercise newline preservation.
@@ -200,23 +221,24 @@ test.describe('Certificates', () => {
       const keyField = drawer.getByLabel(/private key pem/i);
       await keyField.click();
       await keyField.fill(privateKeyPem);
+      expect(await keyField.evaluate((element) => element.tagName)).toBe('TEXTAREA');
+      expect(await keyField.inputValue()).toBe(normalizedPrivateKeyPem);
 
       await drawer.getByRole('button', { name: /import certificate|save changes/i }).click();
       await expect(drawer).not.toBeVisible({ timeout: 10_000 });
 
-      // Verify via the API that the persisted PEM still contains its original
-      // newlines — this is what would fail if the password-input regressed.
+      // The ordinary API confirms that a key is stored but must never return
+      // the key itself. The textarea assertions above guard newline handling.
       const listRes = await page.request.get(`${API}/certificates`, { headers: { Origin: BASE_URL } });
       expect(listRes.ok()).toBe(true);
-      const list = await listRes.json() as Array<{ id: number; name: string; privateKeyPem: string | null }>;
+      const listBody = await listRes.text();
+      const list = JSON.parse(listBody) as Array<{ id: number; name: string; hasPrivateKey: boolean }>;
       const created = list.find((c) => c.name === certName);
       expect(created).toBeTruthy();
       createdId = created!.id;
-      expect(created!.privateKeyPem).toContain('-----BEGIN');
-      expect(created!.privateKeyPem).toContain('-----END');
-      expect(created!.privateKeyPem!.split('\n').length).toBeGreaterThan(3);
-      // The persisted key must round-trip byte-for-byte (ignoring trailing whitespace).
-      expect(created!.privateKeyPem!.trimEnd()).toBe(privateKeyPem.trimEnd());
+      expect(created!.hasPrivateKey).toBe(true);
+      expect(created).not.toHaveProperty('privateKeyPem');
+      expect(listBody).not.toContain(normalizedPrivateKeyPem.split('\n')[1]);
     } finally {
       if (createdId !== null) {
         await page.request.delete(`${API}/certificates/${createdId}`, { headers }).catch(() => undefined);

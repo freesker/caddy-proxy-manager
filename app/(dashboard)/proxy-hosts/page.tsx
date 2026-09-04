@@ -10,6 +10,7 @@ import { listUsers } from "@/src/lib/models/user";
 import { listGroups } from "@/src/lib/models/groups";
 import { getForwardAuthAccessForHost } from "@/src/lib/models/forward-auth";
 import { requireAdmin } from "@/src/lib/auth";
+import { toCertificatePickerOption } from "@/src/lib/certificate-api";
 
 const PER_PAGE = 25;
 
@@ -72,7 +73,7 @@ export default async function ProxyHostsPage({ searchParams }: PageProps) {
   return (
     <ProxyHostsClient
       hosts={hosts}
-      certificates={certificates}
+      certificates={certificates.map(toCertificatePickerOption)}
       caCertificates={caCertificates}
       accessLists={accessLists}
       authentikDefaults={authentikDefaults}

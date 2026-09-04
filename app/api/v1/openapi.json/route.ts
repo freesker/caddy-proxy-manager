@@ -1,11 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireApiAdmin, apiErrorResponse } from "@/src/lib/api-auth";
+import { APP_VERSION } from "@/src/lib/app-version";
 
-export const spec = {
+const spec = {
   openapi: "3.1.0",
   info: {
     title: "Caddy Proxy Manager API",
-    version: "1.0.0",
+    version: APP_VERSION,
     description:
       "REST API for managing Caddy reverse proxy configurations, certificates, access lists, and more.",
   },
@@ -27,6 +28,8 @@ export const spec = {
     { name: "Forward Auth", description: "Forward auth sessions and per-host access control" },
     { name: "Audit Log", description: "Audit log" },
     { name: "Caddy", description: "Caddy server operations" },
+    { name: "Sessions", description: "Your active management-UI sessions" },
+    { name: "OAuth Providers", description: "External OIDC/OAuth2 identity providers for SSO" },
   ],
   paths: {
     // ── Tokens ──────────────────────────────────────────────────────
@@ -53,6 +56,9 @@ export const spec = {
       post: {
         tags: ["Tokens"],
         summary: "Create a token",
+        description:
+          "Requires an interactive cookie-authenticated management session. Bearer tokens cannot create replacement credentials.",
+        security: [{ sessionAuth: [] }],
         operationId: "createToken",
         requestBody: {
           required: true,
@@ -84,6 +90,7 @@ export const spec = {
           },
           "400": { $ref: "#/components/responses/BadRequest" },
           "401": { $ref: "#/components/responses/Unauthorized" },
+          "403": { $ref: "#/components/responses/Forbidden" },
         },
       },
     },
@@ -95,6 +102,74 @@ export const spec = {
         parameters: [{ $ref: "#/components/parameters/IdPath" }],
         responses: {
           "200": { $ref: "#/components/responses/Ok" },
+          "401": { $ref: "#/components/responses/Unauthorized" },
+          "404": { $ref: "#/components/responses/NotFound" },
+        },
+      },
+    },
+
+    // ── Sessions ────────────────────────────────────────────────────
+    "/api/v1/sessions": {
+      get: {
+        tags: ["Sessions"],
+        summary: "List your active sessions",
+        operationId: "listSessions",
+        responses: {
+          "200": {
+            description: "Active sessions for the authenticated user",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    properties: {
+                      id: { type: "integer" },
+                      createdAt: { type: "string" },
+                      updatedAt: { type: "string" },
+                      expiresAt: { type: "string" },
+                      ipAddress: { type: "string", nullable: true },
+                      userAgent: { type: "string", nullable: true },
+                      current: { type: "boolean", description: "True for the session making this request" },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          "401": { $ref: "#/components/responses/Unauthorized" },
+        },
+      },
+      delete: {
+        tags: ["Sessions"],
+        summary: "Revoke all of your other sessions",
+        operationId: "revokeOtherSessions",
+        responses: {
+          "200": {
+            description: "Count of revoked sessions",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: { revoked: { type: "integer" } },
+                  required: ["revoked"],
+                },
+              },
+            },
+          },
+          "401": { $ref: "#/components/responses/Unauthorized" },
+        },
+      },
+    },
+    "/api/v1/sessions/{id}": {
+      delete: {
+        tags: ["Sessions"],
+        summary: "Revoke one of your sessions",
+        operationId: "revokeSession",
+        parameters: [{ $ref: "#/components/parameters/IdPath" }],
+        responses: {
+          "200": { $ref: "#/components/responses/Ok" },
+          "400": { $ref: "#/components/responses/BadRequest" },
           "401": { $ref: "#/components/responses/Unauthorized" },
           "404": { $ref: "#/components/responses/NotFound" },
         },
@@ -783,6 +858,7 @@ export const spec = {
               type: "string",
               enum: [
                 "general",
+                "acme",
                 "cloudflare",
                 "dns-provider",
                 "authentik",
@@ -792,6 +868,8 @@ export const spec = {
                 "upstream-dns",
                 "geoblock",
                 "waf",
+                "error-pages",
+                "default-response",
                 "instance-mode",
                 "sync-token",
               ],
@@ -807,8 +885,8 @@ export const spec = {
                 schema: {
                   oneOf: [
                     { $ref: "#/components/schemas/GeneralSettings" },
-                    { $ref: "#/components/schemas/CloudflareSettings" },
-                    { $ref: "#/components/schemas/DnsProviderSettings" },
+                    { $ref: "#/components/schemas/CloudflareStatus" },
+                    { $ref: "#/components/schemas/DnsProviderStatus" },
                     { $ref: "#/components/schemas/AuthentikSettings" },
                     { $ref: "#/components/schemas/MetricsSettings" },
                     { $ref: "#/components/schemas/LoggingSettings" },
@@ -816,6 +894,7 @@ export const spec = {
                     { $ref: "#/components/schemas/UpstreamDnsSettings" },
                     { $ref: "#/components/schemas/GeoBlockConfig" },
                     { $ref: "#/components/schemas/WafSettings" },
+                    { $ref: "#/components/schemas/DefaultResponseSettings" },
                   ],
                 },
               },
@@ -837,6 +916,7 @@ export const spec = {
               type: "string",
               enum: [
                 "general",
+                "acme",
                 "cloudflare",
                 "dns-provider",
                 "authentik",
@@ -846,6 +926,8 @@ export const spec = {
                 "upstream-dns",
                 "geoblock",
                 "waf",
+                "error-pages",
+                "default-response",
                 "instance-mode",
                 "sync-token",
               ],
@@ -865,9 +947,11 @@ export const spec = {
                   { $ref: "#/components/schemas/MetricsSettings" },
                   { $ref: "#/components/schemas/LoggingSettings" },
                   { $ref: "#/components/schemas/DnsSettings" },
+                  { $ref: "#/components/schemas/DnsProviderSettings" },
                   { $ref: "#/components/schemas/UpstreamDnsSettings" },
                   { $ref: "#/components/schemas/GeoBlockConfig" },
                   { $ref: "#/components/schemas/WafSettings" },
+                  { $ref: "#/components/schemas/DefaultResponseSettings" },
                 ],
               },
             },
@@ -1333,6 +1417,116 @@ export const spec = {
         },
       },
     },
+
+    // ── OAuth Providers ─────────────────────────────────────────────
+    "/api/v1/oauth-providers": {
+      get: {
+        tags: ["OAuth Providers"],
+        summary: "List OAuth providers",
+        operationId: "listOauthProviders",
+        responses: {
+          "200": {
+            description: "List of OAuth providers",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "array",
+                  items: { $ref: "#/components/schemas/OauthProvider" },
+                },
+              },
+            },
+          },
+          "401": { $ref: "#/components/responses/Unauthorized" },
+        },
+      },
+      post: {
+        tags: ["OAuth Providers"],
+        summary: "Create an OAuth provider",
+        operationId: "createOauthProvider",
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: { $ref: "#/components/schemas/OauthProviderInput" },
+            },
+          },
+        },
+        responses: {
+          "201": {
+            description: "OAuth provider created",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/OauthProvider" },
+              },
+            },
+          },
+          "400": { $ref: "#/components/responses/BadRequest" },
+          "401": { $ref: "#/components/responses/Unauthorized" },
+        },
+      },
+    },
+    "/api/v1/oauth-providers/{id}": {
+      get: {
+        tags: ["OAuth Providers"],
+        summary: "Get an OAuth provider",
+        operationId: "getOauthProvider",
+        parameters: [{ $ref: "#/components/parameters/IdPath" }],
+        responses: {
+          "200": {
+            description: "OAuth provider",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/OauthProvider" },
+              },
+            },
+          },
+          "401": { $ref: "#/components/responses/Unauthorized" },
+          "404": { $ref: "#/components/responses/NotFound" },
+        },
+      },
+      put: {
+        tags: ["OAuth Providers"],
+        summary: "Update an OAuth provider",
+        description:
+          "Environment-sourced providers only allow toggling `enabled`. A blank or omitted clientSecret preserves the stored secret.",
+        operationId: "updateOauthProvider",
+        parameters: [{ $ref: "#/components/parameters/IdPath" }],
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: { $ref: "#/components/schemas/OauthProviderUpdate" },
+            },
+          },
+        },
+        responses: {
+          "200": {
+            description: "OAuth provider updated",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/OauthProvider" },
+              },
+            },
+          },
+          "400": { $ref: "#/components/responses/BadRequest" },
+          "401": { $ref: "#/components/responses/Unauthorized" },
+          "404": { $ref: "#/components/responses/NotFound" },
+        },
+      },
+      delete: {
+        tags: ["OAuth Providers"],
+        summary: "Delete an OAuth provider",
+        description: "Environment-sourced providers cannot be deleted.",
+        operationId: "deleteOauthProvider",
+        parameters: [{ $ref: "#/components/parameters/IdPath" }],
+        responses: {
+          "200": { $ref: "#/components/responses/Ok" },
+          "400": { $ref: "#/components/responses/BadRequest" },
+          "401": { $ref: "#/components/responses/Unauthorized" },
+          "404": { $ref: "#/components/responses/NotFound" },
+        },
+      },
+    },
   },
   components: {
     securitySchemes: {
@@ -1571,6 +1765,9 @@ export const spec = {
           custom_directives: { type: "string", description: "Custom WAF directives" },
           excluded_rule_ids: { type: "array", items: { type: "integer" }, description: "Rule IDs to exclude" },
           waf_mode: { type: "string", enum: ["merge", "override"], description: "How per-host WAF merges with global" },
+          request_body_limit: { type: "integer", minimum: 1024, maximum: 1073741824, description: "SecRequestBodyLimit in bytes. Coraza rejects values above 1 GiB. Unset inherits Coraza's default (12.5 MiB when the OWASP CRS is loaded, else 128 MiB)" },
+          request_body_in_memory_limit: { type: "integer", minimum: 1024, maximum: 1073741824, description: "SecRequestBodyInMemoryLimit in bytes; must not exceed request_body_limit" },
+          request_body_limit_action: { type: "string", enum: ["Reject", "ProcessPartial"], description: "SecRequestBodyLimitAction — reject oversized bodies or inspect the buffered part and forward the rest" },
         },
       },
       MtlsConfig: {
@@ -1614,8 +1811,36 @@ export const spec = {
         properties: {
           path: { type: "string", example: "/ws/*", description: "Caddy path pattern to match" },
           upstreams: { type: "array", items: { type: "string" }, example: ["ws-backend:8080", "ws-backend2:8080"], description: "Upstream servers for this path" },
+          loadBalancer: { oneOf: [{ $ref: "#/components/schemas/LoadBalancerConfig" }, { type: "null" }], description: "Optional per-rule load balancing and health checks for this path's upstreams" },
         },
         required: ["path", "upstreams"],
+      },
+      PathAllowRule: {
+        type: "object",
+        description: "Allow a request path to bypass any matching Path Block and reach the upstream. Evaluated before blocks.",
+        properties: {
+          path: { type: "string", example: "/secret", description: "Caddy path pattern to allow through" },
+        },
+        required: ["path"],
+      },
+      PathBlockRule: {
+        type: "object",
+        description: "Block a request path with a static response (no proxying)",
+        properties: {
+          path: { type: "string", example: "/dns-query", description: "Caddy path pattern to match" },
+          status: { type: "integer", enum: [400, 401, 403, 404, 410, 418, 451, 500, 502, 503], example: 403 },
+          body: { type: "string", example: "Forbidden", description: "Optional response body" },
+        },
+        required: ["path", "status"],
+      },
+      PathRewriteRule: {
+        type: "object",
+        description: "Internally rewrite the request URI before proxying (client URL is unchanged)",
+        properties: {
+          from: { type: "string", example: "/secretpath", description: "Caddy path pattern to match" },
+          to: { type: "string", example: "/dns-query", description: "Internal target URI" },
+        },
+        required: ["from", "to"],
       },
 
       // ── Main resource schemas ───────────────────────────────────
@@ -1651,6 +1876,9 @@ export const spec = {
           redirects: { type: "array", items: { $ref: "#/components/schemas/RedirectRule" } },
           rewrite: { oneOf: [{ $ref: "#/components/schemas/RewriteConfig" }, { type: "null" }] },
           locationRules: { type: "array", items: { $ref: "#/components/schemas/LocationRule" }, description: "Path-based routing rules (routes specific paths to different upstreams)" },
+          pathAllows: { type: "array", items: { $ref: "#/components/schemas/PathAllowRule" }, description: "Paths that bypass any matching Path Block and reach the upstream (evaluated first)" },
+          pathBlocks: { type: "array", items: { $ref: "#/components/schemas/PathBlockRule" }, description: "Paths blocked with a static response" },
+          pathRewrites: { type: "array", items: { $ref: "#/components/schemas/PathRewriteRule" }, description: "Internal URI rewrites applied before proxying" },
         },
         required: ["id", "name", "domains", "upstreams", "enabled", "createdAt", "updatedAt"],
       },
@@ -1683,6 +1911,9 @@ export const spec = {
           redirects: { type: "array", items: { $ref: "#/components/schemas/RedirectRule" } },
           rewrite: { oneOf: [{ $ref: "#/components/schemas/RewriteConfig" }, { type: "null" }] },
           locationRules: { type: "array", items: { $ref: "#/components/schemas/LocationRule" }, description: "Path-based routing rules (routes specific paths to different upstreams)" },
+          pathAllows: { type: "array", items: { $ref: "#/components/schemas/PathAllowRule" }, description: "Paths that bypass any matching Path Block and reach the upstream (evaluated first)" },
+          pathBlocks: { type: "array", items: { $ref: "#/components/schemas/PathBlockRule" }, description: "Paths blocked with a static response" },
+          pathRewrites: { type: "array", items: { $ref: "#/components/schemas/PathRewriteRule" }, description: "Internal URI rewrites applied before proxying" },
         },
         required: ["name", "domains", "upstreams"],
       },
@@ -1741,15 +1972,17 @@ export const spec = {
           autoRenew: { type: "boolean" },
           providerOptions: {
             type: ["object", "null"],
-            description: "Provider-specific options (e.g. Cloudflare API token). Free-form key/value object passed through to the DNS provider.",
-            additionalProperties: true,
+            description: "Optional reference to a centrally configured DNS provider. Credential values are never returned here.",
+            properties: { provider: { type: "string" } },
+            required: ["provider"],
+            additionalProperties: false,
           },
           certificatePem: { type: ["string", "null"], description: "PEM-encoded certificate (imported type only)" },
-          privateKeyPem: { type: ["string", "null"], description: "PEM-encoded private key (imported type only)" },
+          hasPrivateKey: { type: "boolean", description: "Whether write-only private key material is stored" },
           createdAt: { type: "string", format: "date-time" },
           updatedAt: { type: "string", format: "date-time" },
         },
-        required: ["id", "name", "type", "domainNames", "createdAt", "updatedAt"],
+        required: ["id", "name", "type", "domainNames", "hasPrivateKey", "createdAt", "updatedAt"],
       },
       CertificateInput: {
         type: "object",
@@ -1758,9 +1991,14 @@ export const spec = {
           type: { type: "string", enum: ["managed", "imported"] },
           domainNames: { type: "array", items: { type: "string" } },
           autoRenew: { type: "boolean" },
-          providerOptions: { type: ["object", "null"], additionalProperties: true },
+          providerOptions: {
+            type: ["object", "null"],
+            properties: { provider: { type: "string" } },
+            required: ["provider"],
+            additionalProperties: false,
+          },
           certificatePem: { type: ["string", "null"] },
-          privateKeyPem: { type: ["string", "null"] },
+          privateKeyPem: { type: ["string", "null"], writeOnly: true },
         },
         required: ["name", "type", "domainNames"],
       },
@@ -1878,22 +2116,33 @@ export const spec = {
       },
       CloudflareSettings: {
         type: "object",
+        description: "Write-only legacy Cloudflare settings. The API token is accepted on update but never returned by GET.",
         properties: {
-          apiToken: { type: "string", description: "Cloudflare API token" },
+          apiToken: { type: "string", description: "Cloudflare API token", writeOnly: true },
           zoneId: { type: "string" },
           accountId: { type: "string" },
         },
         required: ["apiToken"],
       },
+      CloudflareStatus: {
+        type: "object",
+        description: "Non-secret metadata for the legacy Cloudflare settings group.",
+        properties: {
+          hasApiToken: { type: "boolean" },
+          zoneId: { type: "string" },
+          accountId: { type: "string" },
+        },
+        required: ["hasApiToken"],
+      },
       DnsProviderSettings: {
         type: "object",
-        description: "DNS provider configuration for ACME DNS-01 challenges. Supports multiple configured providers with a default.",
+        description: "Write-only DNS provider configuration for ACME DNS-01 challenges. Credential values are accepted on update but never returned by GET.",
         properties: {
           providers: {
             type: "object",
             additionalProperties: {
               type: "object",
-              additionalProperties: { type: "string" },
+              additionalProperties: { type: "string", writeOnly: true },
               description: "Credential key-value pairs for this provider",
             },
             description: "Configured providers keyed by name (e.g. { cloudflare: { api_token: '...' }, route53: { ... } })",
@@ -1902,6 +2151,32 @@ export const spec = {
             type: "string",
             nullable: true,
             description: "Name of the default provider used for DNS-01 challenges (null = HTTP-01 only)",
+          },
+        },
+        required: ["providers", "default"],
+      },
+      DnsProviderStatus: {
+        type: "object",
+        description: "Non-secret metadata for configured DNS providers. Credential values are write-only.",
+        properties: {
+          providers: {
+            type: "object",
+            additionalProperties: {
+              type: "object",
+              properties: {
+                configuredFields: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Credential field names which have a stored, non-empty value",
+                },
+              },
+              required: ["configuredFields"],
+            },
+            description: "Configured providers keyed by provider name; values contain metadata only",
+          },
+          default: {
+            type: ["string", "null"],
+            description: "Name of the default provider used for DNS-01 challenges",
           },
         },
         required: ["providers", "default"],
@@ -1931,6 +2206,31 @@ export const spec = {
         },
         required: ["enabled"],
       },
+      DefaultResponseSettings: {
+        type: "object",
+        description: "Catch-all behavior for requests that do not match a configured proxy host.",
+        properties: {
+          mode: {
+            type: "string",
+            enum: ["caddy", "respond", "redirect", "abort"],
+            description: "caddy preserves native routing/automatic-HTTPS behavior; abort closes the connection without a response.",
+          },
+          status: {
+            type: "integer",
+            minimum: 200,
+            maximum: 599,
+            description: "HTTP response status, or one of 301/302/303/307/308 for redirect mode.",
+          },
+          body: { type: "string", description: "Body used by respond mode." },
+          headers: {
+            type: "object",
+            additionalProperties: { type: "string" },
+            description: "Optional response headers. Values must not contain newlines.",
+          },
+          redirectUrl: { type: "string", description: "Target used by redirect mode." },
+        },
+        required: ["mode"],
+      },
       DnsSettings: {
         type: "object",
         properties: {
@@ -1958,6 +2258,9 @@ export const spec = {
           load_owasp_crs: { type: "boolean" },
           custom_directives: { type: "string" },
           excluded_rule_ids: { type: "array", items: { type: "integer" } },
+          request_body_limit: { type: "integer", minimum: 1024, maximum: 1073741824, description: "SecRequestBodyLimit in bytes. Coraza rejects values above 1 GiB. Unset inherits Coraza's default (12.5 MiB when the OWASP CRS is loaded, else 128 MiB)" },
+          request_body_in_memory_limit: { type: "integer", minimum: 1024, maximum: 1073741824, description: "SecRequestBodyInMemoryLimit in bytes; must not exceed request_body_limit" },
+          request_body_limit_action: { type: "string", enum: ["Reject", "ProcessPartial"], description: "SecRequestBodyLimitAction — reject oversized bodies or inspect the buffered part and forward the rest" },
         },
         required: ["enabled", "mode", "load_owasp_crs", "custom_directives"],
       },
@@ -2018,7 +2321,12 @@ export const spec = {
         properties: {
           name: { type: "string", example: "Slave 1" },
           baseUrl: { type: "string", example: "https://slave.example.com:3000" },
-          apiToken: { type: "string", description: "Sync token for the slave instance" },
+          apiToken: {
+            type: "string",
+            minLength: 32,
+            maxLength: 512,
+            description: "Random sync token for the slave instance (generate with: openssl rand -hex 32)",
+          },
           enabled: { type: "boolean" },
         },
         required: ["name", "baseUrl", "apiToken"],
@@ -2032,6 +2340,82 @@ export const spec = {
           skippedHttp: { type: "integer" },
         },
         required: ["total", "success", "failed", "skippedHttp"],
+      },
+      OauthProvider: {
+        type: "object",
+        description:
+          "OAuth/OIDC provider. clientId is masked; the clientSecret is never exposed. callbackUrl is the exact redirect URI to register at the identity provider.",
+        properties: {
+          id: { type: "string", example: "authino" },
+          name: { type: "string", example: "Authino" },
+          type: { type: "string", enum: ["oidc", "oauth2"] },
+          clientId: { type: "string", readOnly: true, example: "••••41ee" },
+          hasClientSecret: { type: "boolean", readOnly: true },
+          issuer: { type: ["string", "null"] },
+          authorizationUrl: { type: ["string", "null"] },
+          tokenUrl: { type: ["string", "null"] },
+          userinfoUrl: { type: ["string", "null"] },
+          scopes: { type: "string", example: "openid email profile" },
+          autoLink: { type: "boolean" },
+          enabled: { type: "boolean" },
+          source: { type: "string", enum: ["env", "ui"], readOnly: true },
+          callbackUrl: {
+            type: "string",
+            readOnly: true,
+            example: "https://cpm.example.com/api/auth/callback/authino",
+            description: "Register this URI as the redirect URI in the identity provider",
+          },
+          createdAt: { type: "string", format: "date-time" },
+          updatedAt: { type: "string", format: "date-time" },
+        },
+        required: [
+          "id",
+          "name",
+          "type",
+          "clientId",
+          "hasClientSecret",
+          "scopes",
+          "autoLink",
+          "enabled",
+          "source",
+          "callbackUrl",
+          "createdAt",
+          "updatedAt",
+        ],
+      },
+      OauthProviderInput: {
+        type: "object",
+        properties: {
+          name: { type: "string", example: "Keycloak" },
+          type: { type: "string", enum: ["oidc", "oauth2"], default: "oidc" },
+          clientId: { type: "string" },
+          clientSecret: { type: "string" },
+          issuer: { type: "string", example: "https://sso.example.com/realms/main" },
+          authorizationUrl: { type: "string" },
+          tokenUrl: { type: "string" },
+          userinfoUrl: { type: "string" },
+          scopes: { type: "string", default: "openid email profile" },
+          autoLink: { type: "boolean", default: false },
+          enabled: { type: "boolean", default: true },
+        },
+        required: ["name", "clientId", "clientSecret"],
+      },
+      OauthProviderUpdate: {
+        type: "object",
+        description: "All fields optional. Omitting clientSecret preserves the stored secret.",
+        properties: {
+          name: { type: "string" },
+          type: { type: "string", enum: ["oidc", "oauth2"] },
+          clientId: { type: "string" },
+          clientSecret: { type: "string" },
+          issuer: { type: ["string", "null"] },
+          authorizationUrl: { type: ["string", "null"] },
+          tokenUrl: { type: ["string", "null"] },
+          userinfoUrl: { type: ["string", "null"] },
+          scopes: { type: "string" },
+          autoLink: { type: "boolean" },
+          enabled: { type: "boolean" },
+        },
       },
       User: {
         type: "object",

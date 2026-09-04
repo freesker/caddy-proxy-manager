@@ -99,4 +99,79 @@ test.describe('L4 Proxy Hosts page', () => {
     await expect(page.getByRole('dialog')).not.toBeVisible({ timeout: 10_000 });
     await expect(page.getByText('E2E Test Host')).not.toBeVisible({ timeout: 5_000 });
   });
+
+  /**
+   * Regression (#241): creating multiple L4 hosts back-to-back left the table
+   * stale until a manual browser refresh — the create dialog's form state
+   * survived between opens and revalidation raced the close. Each save must
+   * be reflected in the table with no reload, even on rapid successive saves.
+   */
+  test('rapid successive creates are all reflected in the table without reload', async ({ page }) => {
+    await page.goto('/l4-proxy-hosts');
+
+    for (let i = 1; i <= 3; i++) {
+      // Re-open the dialog each iteration — this is what exercised the stale
+      // useActionState bug (dialog remount now resets form state).
+      await page.getByRole('button', { name: /create l4 host/i }).click();
+      await expect(page.getByRole('dialog')).toBeVisible();
+      await page.getByLabel('Name').fill(`E2E Rapid Host ${i}`);
+      await page.getByLabel('Listen Address').fill(`:2000${i}`);
+      await page.getByLabel('Upstreams').fill('10.0.0.1:5432');
+
+      await page.getByRole('button', { name: /create/i }).click();
+
+      // Dialog closes on success, host appears in table — no page.reload()
+      await expect(page.getByRole('dialog')).not.toBeVisible({ timeout: 10_000 });
+      await expect(page.getByRole('table').getByText(`E2E Rapid Host ${i}`)).toBeVisible({ timeout: 10_000 });
+    }
+  });
+
+  test('cleanup rapid hosts', async ({ page }) => {
+    await page.goto('/l4-proxy-hosts');
+    for (let i = 1; i <= 3; i++) {
+      const row = page.locator('tr', { hasText: `E2E Rapid Host ${i}` });
+      await expect(row).toBeVisible();
+      await row.getByRole('button').first().click();
+      await page.getByRole('menuitem', { name: /delete/i }).click();
+      await expect(page.getByRole('dialog')).toBeVisible();
+      await page.getByRole('button', { name: /delete/i }).click();
+      await expect(page.getByRole('dialog')).not.toBeVisible({ timeout: 10_000 });
+      await expect(page.getByText(`E2E Rapid Host ${i}`)).not.toBeVisible({ timeout: 5_000 });
+    }
+  });
+
+  /**
+   * Regression (#241): toggling a host's enabled switch updated the DB but
+   * the row kept showing the old status until a browser refresh.
+   */
+  test('toggling enabled updates the row status without reload', async ({ page }) => {
+    await page.goto('/l4-proxy-hosts');
+    await page.getByRole('button', { name: /create l4 host/i }).click();
+    await page.getByLabel('Name').fill('E2E Toggle Host');
+    await page.getByLabel('Listen Address').fill(':20010');
+    await page.getByLabel('Upstreams').fill('10.0.0.1:5432');
+    await page.getByRole('button', { name: /create/i }).click();
+    await expect(page.getByRole('dialog')).not.toBeVisible({ timeout: 10_000 });
+
+    const row = page.locator('tr', { hasText: 'E2E Toggle Host' });
+    const rowSwitch = row.getByRole('switch').first();
+    await expect(row).toBeVisible();
+
+    // Toggle off — the row must show the new status without a reload
+    await expect(rowSwitch).toHaveAttribute('data-state', 'checked');
+    await rowSwitch.click();
+    await expect(rowSwitch).toHaveAttribute('data-state', 'unchecked', { timeout: 10_000 });
+
+    // Toggle back on
+    await rowSwitch.click();
+    await expect(rowSwitch).toHaveAttribute('data-state', 'checked', { timeout: 10_000 });
+
+    // Cleanup
+    await row.getByRole('button').first().click();
+    await page.getByRole('menuitem', { name: /delete/i }).click();
+    await expect(page.getByRole('dialog')).toBeVisible();
+    await page.getByRole('button', { name: /delete/i }).click();
+    await expect(page.getByRole('dialog')).not.toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText('E2E Toggle Host')).not.toBeVisible({ timeout: 5_000 });
+  });
 });

@@ -17,7 +17,11 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
-import type { OAuthProvider } from "@/src/lib/models/oauth-providers";
+import {
+  oauthCallbackUrl,
+  withOAuthClientSecretRotation,
+  type OAuthProviderView,
+} from "@/src/lib/oauth-provider-view";
 import {
   createOAuthProviderAction,
   updateOAuthProviderAction,
@@ -25,7 +29,7 @@ import {
 } from "./actions";
 
 interface OAuthProvidersSectionProps {
-  initialProviders: OAuthProvider[];
+  initialProviders: OAuthProviderView[];
   baseUrl: string;
 }
 
@@ -60,7 +64,8 @@ const emptyForm: FormData = {
 export default function OAuthProvidersSection({ initialProviders, baseUrl }: OAuthProvidersSectionProps) {
   const [providers, setProviders] = useState(initialProviders);
   const [dialogOpen, setDialogOpen] = useState(false);
-  const [editingProvider, setEditingProvider] = useState<OAuthProvider | null>(null);
+  const [editingProvider, setEditingProvider] = useState<OAuthProviderView | null>(null);
+  const [rotateClientSecret, setRotateClientSecret] = useState(false);
   const [form, setForm] = useState<FormData>(emptyForm);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -68,24 +73,36 @@ export default function OAuthProvidersSection({ initialProviders, baseUrl }: OAu
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
 
   const callbackUrl = useCallback(
-    (providerId: string) => `${baseUrl}/api/auth/oauth2/callback/${providerId}`,
+    (providerId: string) => oauthCallbackUrl(baseUrl, providerId),
     [baseUrl]
   );
 
+  function closeDialog() {
+    // Clear any newly-entered replacement secret from client memory as soon
+    // as the dialog closes.
+    setDialogOpen(false);
+    setEditingProvider(null);
+    setRotateClientSecret(false);
+    setForm(emptyForm);
+    setError(null);
+  }
+
   function openAddDialog() {
     setEditingProvider(null);
+    setRotateClientSecret(true);
     setForm(emptyForm);
     setError(null);
     setDialogOpen(true);
   }
 
-  function openEditDialog(provider: OAuthProvider) {
+  function openEditDialog(provider: OAuthProviderView) {
     setEditingProvider(provider);
+    setRotateClientSecret(false);
     setForm({
       name: provider.name,
       type: provider.type,
       clientId: provider.clientId,
-      clientSecret: provider.clientSecret,
+      clientSecret: "",
       issuer: provider.issuer ?? "",
       authorizationUrl: provider.authorizationUrl ?? "",
       tokenUrl: provider.tokenUrl ?? "",
@@ -99,7 +116,8 @@ export default function OAuthProvidersSection({ initialProviders, baseUrl }: OAu
   }
 
   async function handleSave() {
-    if (!form.name.trim() || !form.clientId.trim() || !form.clientSecret.trim()) {
+    const secretRequired = !editingProvider || rotateClientSecret || !editingProvider.hasClientSecret;
+    if (!form.name.trim() || !form.clientId.trim() || (secretRequired && !form.clientSecret.trim())) {
       setError("Name, Client ID, and Client Secret are required.");
       return;
     }
@@ -109,11 +127,10 @@ export default function OAuthProvidersSection({ initialProviders, baseUrl }: OAu
 
     try {
       if (editingProvider) {
-        const updated = await updateOAuthProviderAction(editingProvider.id, {
+        const update = withOAuthClientSecretRotation({
           name: form.name.trim(),
           type: form.type,
           clientId: form.clientId.trim(),
-          clientSecret: form.clientSecret.trim(),
           issuer: form.issuer.trim() || null,
           authorizationUrl: form.authorizationUrl.trim() || null,
           tokenUrl: form.tokenUrl.trim() || null,
@@ -121,7 +138,8 @@ export default function OAuthProvidersSection({ initialProviders, baseUrl }: OAu
           scopes: form.scopes.trim() || "openid email profile",
           rolesClaim: form.rolesClaim.trim() || null,
           autoLink: form.autoLink,
-        });
+        }, secretRequired ? form.clientSecret : undefined);
+        const updated = await updateOAuthProviderAction(editingProvider.id, update);
         if (updated) {
           setProviders((prev) =>
             prev.map((p) => (p.id === editingProvider.id ? updated : p))
@@ -143,7 +161,7 @@ export default function OAuthProvidersSection({ initialProviders, baseUrl }: OAu
         });
         setProviders((prev) => [...prev, created]);
       }
-      setDialogOpen(false);
+      closeDialog();
     } catch (err) {
       setError(err instanceof Error ? err.message : "An error occurred");
     } finally {
@@ -151,7 +169,7 @@ export default function OAuthProvidersSection({ initialProviders, baseUrl }: OAu
     }
   }
 
-  async function handleToggleEnabled(provider: OAuthProvider) {
+  async function handleToggleEnabled(provider: OAuthProviderView) {
     try {
       const updated = await updateOAuthProviderAction(provider.id, {
         enabled: !provider.enabled,
@@ -292,7 +310,13 @@ export default function OAuthProvidersSection({ initialProviders, baseUrl }: OAu
       </div>
 
       {/* Add / Edit Dialog */}
-      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+      <Dialog
+        open={dialogOpen}
+        onOpenChange={(open) => {
+          if (open) setDialogOpen(true);
+          else closeDialog();
+        }}
+      >
         <DialogContent className="sm:max-w-lg max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>
@@ -349,17 +373,58 @@ export default function OAuthProvidersSection({ initialProviders, baseUrl }: OAu
               />
             </div>
 
-            <div className="flex flex-col gap-1.5">
-              <Label htmlFor="oauth-client-secret">Client Secret *</Label>
-              <Input
-                id="oauth-client-secret"
-                type="password"
-                autoComplete="new-password"
-                value={form.clientSecret}
-                onChange={(e) => updateField("clientSecret", e.target.value)}
-                className="h-8 text-sm"
-              />
-            </div>
+            {editingProvider?.hasClientSecret && !rotateClientSecret ? (
+              <div className="flex items-center justify-between gap-3 rounded-md border px-3 py-2">
+                <div>
+                  <Label>Client Secret</Label>
+                  <p className="text-xs text-muted-foreground">
+                    A secret is configured. Its existing value cannot be viewed.
+                  </p>
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setRotateClientSecret(true)}
+                >
+                  Rotate Secret
+                </Button>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <Label htmlFor="oauth-client-secret">
+                    {editingProvider ? "New Client Secret *" : "Client Secret *"}
+                  </Label>
+                  {editingProvider?.hasClientSecret && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => {
+                        setRotateClientSecret(false);
+                        updateField("clientSecret", "");
+                      }}
+                    >
+                      Keep Existing
+                    </Button>
+                  )}
+                </div>
+                <Input
+                  id="oauth-client-secret"
+                  type="password"
+                  autoComplete="new-password"
+                  value={form.clientSecret}
+                  onChange={(e) => updateField("clientSecret", e.target.value)}
+                  className="h-8 text-sm"
+                />
+                {editingProvider && (
+                  <p className="text-xs text-muted-foreground">
+                    Saving this field replaces the stored secret.
+                  </p>
+                )}
+              </div>
+            )}
 
             <div className="flex flex-col gap-1.5">
               <Label htmlFor="oauth-issuer">Issuer URL</Label>
@@ -469,7 +534,7 @@ export default function OAuthProvidersSection({ initialProviders, baseUrl }: OAu
           </div>
 
           <DialogFooter>
-            <Button variant="outline" onClick={() => setDialogOpen(false)}>
+            <Button variant="outline" onClick={closeDialog}>
               Cancel
             </Button>
             <Button onClick={handleSave} disabled={saving}>

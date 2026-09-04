@@ -1,6 +1,6 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { Resolver } from "node:dns/promises";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { isIP } from "node:net";
 import crypto from "node:crypto";
 import {
@@ -27,6 +27,7 @@ import { eq, isNull } from "drizzle-orm";
 import { config } from "./config";
 import {
   getGeneralSettings,
+  getAcmeSettings,
   getMetricsSettings,
   getLoggingSettings,
   getDnsSettings,
@@ -34,13 +35,19 @@ import {
   getUpstreamDnsResolutionSettings,
   getGeoBlockSettings,
   getWafSettings,
+  getErrorPagesSettings,
+  getDefaultResponseSettings,
+  getTrustedProxiesSettings,
   setSetting,
+  type AcmeSettings,
   type DnsSettings,
   type UpstreamDnsAddressFamily,
   type UpstreamDnsResolutionSettings,
   type GeoBlockSettings,
-  type WafSettings
+  type WafSettings,
+  type TrustedProxiesSettings
 } from "./settings";
+import { buildDefaultResponseRoute } from "./caddy-default-response";
 import { buildDnsChallengeConfig, type DnsProviderCredentials } from "./dns-providers";
 import { syncInstances } from "./instance-sync";
 import {
@@ -51,14 +58,60 @@ import {
   proxyHosts,
   l4ProxyHosts
 } from "./db/schema";
-import { type GeoBlockMode, type WafHostConfig, type MtlsConfig, type RedirectRule, type RewriteConfig, type LocationRule } from "./models/proxy-hosts";
+import { type GeoBlockMode, type WafHostConfig, type MtlsConfig, type RedirectRule, type RewriteConfig, type LocationRuleMeta, type PathAllowRule, type PathBlockRule, type PathRewriteRule, type ErrorPageRule } from "./models/proxy-hosts";
 import { buildClientAuthentication, groupMtlsDomainsByCaSet, buildMtlsRbacSubroutes, buildFingerprintCelExpression, buildValidClientCertCelExpression, resolveAllowedFingerprints, type MtlsAccessRuleLike } from "./caddy-mtls";
 import { buildRoleFingerprintMap, buildCertFingerprintMap, buildRoleCertIdMap } from "./models/mtls-roles";
 import { getAccessRulesForHosts } from "./models/mtls-access-rules";
-import { buildWafHandler, resolveEffectiveWaf } from "./caddy-waf";
+import { buildWafHandlerEntry, resolveEffectiveWaf } from "./caddy-waf";
+import {
+  FORWARD_AUTH_PROXY_PROOF_HEADER,
+  getForwardAuthProxyProof,
+} from "./forward-auth-trust";
+import { decryptSecret } from "./secret";
+import {
+  CaddyApplyError,
+  describeCaddyRejection,
+  logCaddyApplyFailure,
+  safeSystemErrorCode,
+} from "./caddy-apply-error";
 
 const CERTS_DIR = process.env.CERTS_DIRECTORY || join(process.cwd(), "data", "certs");
 mkdirSync(CERTS_DIR, { recursive: true, mode: 0o700 });
+
+// Directory shared (via a Docker volume) with the Caddy container, so a
+// custom ACME CA root PEM written here by the web container is readable by
+// Caddy at the same path for `trusted_roots_pem_files`. Read lazily so tests
+// (and non-Docker deployments) can override ACME_CA_ROOT_DIR at runtime.
+function acmeCaRootFile(): string {
+  return join(process.env.ACME_CA_ROOT_DIR || "/acme-ca", "custom-ca-root.pem");
+}
+
+/**
+ * Persist (or clear) the custom ACME CA root PEM to the shared volume and
+ * return the file path Caddy should reference, or null if no root is
+ * configured or the file could not be written (in which case the issuer is
+ * left without `trusted_roots_pem_files` rather than pointing at a missing file).
+ */
+function syncAcmeCaRootFile(caRootPem: string | undefined): string | null {
+  const file = acmeCaRootFile();
+  const pem = caRootPem?.trim();
+  if (!pem) {
+    try {
+      rmSync(file, { force: true });
+    } catch {
+      // best-effort cleanup
+    }
+    return null;
+  }
+  try {
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, pem.endsWith("\n") ? pem : `${pem}\n`, { mode: 0o644 });
+    return file;
+  } catch (error) {
+    console.error(`Failed to write ACME CA root PEM to ${file}`, error);
+    return null;
+  }
+}
 
 const DEFAULT_AUTHENTIK_HEADERS = [
   "X-Authentik-Username",
@@ -136,7 +189,11 @@ type ProxyHostMeta = {
   mtls?: MtlsMeta;
   redirects?: RedirectRule[];
   rewrite?: RewriteConfig;
-  location_rules?: LocationRule[];
+  location_rules?: LocationRuleMeta[];
+  path_allows?: PathAllowRule[];
+  path_blocks?: PathBlockRule[];
+  path_rewrites?: PathRewriteRule[];
+  error_pages?: ErrorPageRule[];
 };
 
 type L4Meta = {
@@ -639,6 +696,53 @@ export function buildBlockerHandler(config: GeoBlockSettings): Record<string, un
   return handler;
 }
 
+/**
+ * Normalize the configured trusted-proxy ranges: trim, drop blanks, and expand
+ * the "private_ranges" shorthand into concrete CIDRs (matching how the geoblock
+ * and Authentik handlers treat the same shorthand).
+ */
+export function normalizeTrustedProxyRanges(ranges: string[] | undefined | null): string[] {
+  return expandPrivateRanges((ranges ?? []).map((r) => r.trim()).filter(Boolean));
+}
+
+/**
+ * Build the server-level trusted-proxy fields for the main HTTP server object
+ * (`servers.cpm`). Caddy resolves `{http.request.client_ip}` in core — before
+ * any handler runs — so this is the only place a global trusted-proxy list can
+ * fix client-IP attribution for access logs, analytics and downstream handlers.
+ *
+ * Returns an empty object (nothing emitted, current behaviour preserved) unless
+ * at least one range is configured.
+ */
+export function buildServerTrustedProxies(
+  settings: TrustedProxiesSettings | null | undefined
+): {
+  trusted_proxies?: { source: string; ranges: string[] };
+  client_ip_headers?: string[];
+  trusted_proxies_strict?: number;
+} {
+  if (!settings) return {};
+
+  const ranges = normalizeTrustedProxyRanges(settings.ranges);
+  if (ranges.length === 0) return {};
+
+  const out: {
+    trusted_proxies: { source: string; ranges: string[] };
+    client_ip_headers?: string[];
+    trusted_proxies_strict?: number;
+  } = {
+    trusted_proxies: { source: "static", ranges }
+  };
+
+  const headers = (settings.client_ip_headers ?? []).map((h) => h.trim()).filter(Boolean);
+  if (headers.length > 0) out.client_ip_headers = headers;
+
+  // Caddy's trusted_proxies_strict is an int flag (1 = strict, 0 = off).
+  if (settings.strict) out.trusted_proxies_strict = 1;
+
+  return out;
+}
+
 type BuildProxyRoutesOptions = {
   globalDnsSettings: DnsSettings | null;
   globalUpstreamDnsResolutionSettings: UpstreamDnsResolutionSettings | null;
@@ -652,7 +756,7 @@ type BuildProxyRoutesOptions = {
 };
 
 export function buildLocationReverseProxy(
-  rule: LocationRule,
+  rule: LocationRuleMeta,
   skipHttpsValidation: boolean,
   preserveHostHeader: boolean
 ): { safePath: string; reverseProxyHandler: Record<string, unknown> } {
@@ -680,7 +784,49 @@ export function buildLocationReverseProxy(
     };
   }
 
+  // Per-rule load balancing / health checks (mirrors the host-level config).
+  const lbConfig = parseLoadBalancerConfig(rule.load_balancer);
+  if (lbConfig) {
+    const loadBalancing = buildLoadBalancingConfig(lbConfig);
+    if (loadBalancing) {
+      reverseProxyHandler.load_balancing = loadBalancing;
+    }
+    const healthChecks = buildHealthChecksConfig(lbConfig);
+    if (healthChecks) {
+      reverseProxyHandler.health_checks = healthChecks;
+    }
+  }
+
   return { safePath, reverseProxyHandler };
+}
+
+// Builds a Caddy server-level error route (handle_errors equivalent) that serves a
+// custom static response while preserving the original error status code. An empty
+// `statuses` list matches every error; `hosts`, when set, scopes the route to a host.
+export function buildErrorPageRoute(rule: ErrorPageRule, hosts?: string[]): CaddyHttpRoute {
+  const matcher: Record<string, unknown> = {};
+  if (hosts && hosts.length > 0) {
+    matcher.host = hosts;
+  }
+  if (rule.statuses.length > 0) {
+    // Mirrors Caddy's documented handle_errors form, e.g. {http.error.status_code} == 404
+    matcher.expression = rule.statuses.map((s) => `{http.error.status_code} == ${s}`).join(" || ");
+  }
+  const route: CaddyHttpRoute = {
+    handle: [
+      {
+        handler: "static_response",
+        status_code: "{http.error.status_code}",
+        body: rule.body,
+        headers: { "Content-Type": [rule.contentType || "text/html; charset=utf-8"] },
+      },
+    ],
+    terminal: true,
+  };
+  if (Object.keys(matcher).length > 0) {
+    route.match = [matcher];
+  }
+  return route;
 }
 
 async function buildProxyRoutes(
@@ -688,8 +834,9 @@ async function buildProxyRoutes(
   accessAccounts: Map<number, AccessListEntryRow[]>,
   tlsReadyCertificates: Set<number>,
   options: BuildProxyRoutesOptions
-): Promise<CaddyHttpRoute[]> {
+): Promise<{ routes: CaddyHttpRoute[]; errorRoutes: CaddyHttpRoute[] }> {
   const routes: CaddyHttpRoute[] = [];
+  const errorRoutes: CaddyHttpRoute[] = [];
   const validClientCertExpression = buildValidClientCertCelExpression();
 
   for (const row of rows) {
@@ -736,7 +883,7 @@ async function buildProxyRoutes(
       meta.waf
     );
     if (effectiveWaf?.enabled && effectiveWaf.mode !== 'Off') {
-      handlers.unshift(buildWafHandler(effectiveWaf, Boolean(row.allowWebsocket)));
+      handlers.unshift(buildWafHandlerEntry(effectiveWaf, Boolean(row.allowWebsocket)));
     }
 
     if (row.hstsEnabled) {
@@ -770,6 +917,65 @@ async function buildProxyRoutes(
             }
           ],
           terminal: true
+        });
+      }
+    }
+
+    // Path blocks (terminal static_response) and path rewrites (URI rewrite).
+    //
+    // Path Allows are not emitted as standalone routes — a terminal match with
+    // an empty handle would stop the subroute without falling through to the
+    // reverse_proxy, returning an empty 200. Instead, every allow pattern is
+    // folded into each block's matcher as a `not` clause: a block matches when
+    // the request path matches the block pattern AND does not match any allow
+    // pattern. Allowed requests therefore skip every block and exit the
+    // subroute naturally, continuing to the outer reverse_proxy. Allows do not
+    // affect rewrites — those keep their original matchers.
+    const pathAllows = meta.path_allows ?? [];
+    const pathBlocks = meta.path_blocks ?? [];
+    const pathRewrites = meta.path_rewrites ?? [];
+    if (pathBlocks.length > 0 || pathRewrites.length > 0) {
+      const allowPatterns = pathAllows
+        .map((a) => a.path.replace(/\{[^}]*\}/g, ''))
+        .filter((p) => p.length > 0);
+      const pathRoutes: CaddyHttpRoute[] = [];
+      for (const block of pathBlocks) {
+        // Sanitize path to prevent Caddy placeholder injection
+        const safePath = block.path.replace(/\{[^}]*\}/g, '');
+        if (!safePath) continue;
+        const handle: Record<string, unknown> = {
+          handler: "static_response",
+          status_code: block.status,
+        };
+        if (block.body) {
+          handle.body = block.body;
+        }
+        const matcher: Record<string, unknown> = { path: [safePath] };
+        if (allowPatterns.length > 0) {
+          matcher.not = [{ path: allowPatterns }];
+        }
+        pathRoutes.push({
+          match: [matcher],
+          handle: [handle],
+          terminal: true,
+        });
+      }
+      for (const rw of pathRewrites) {
+        const safeFrom = rw.from.replace(/\{[^}]*\}/g, '');
+        const safeTo = rw.to.replace(/\{[^}]*\}/g, '');
+        if (!safeFrom || !safeTo) continue;
+        pathRoutes.push({
+          match: [{ path: [safeFrom] }],
+          handle: [{
+            handler: "rewrite",
+            uri: safeTo,
+          }],
+        });
+      }
+      if (pathRoutes.length > 0) {
+        handlers.push({
+          handler: "subroute",
+          routes: pathRoutes,
         });
       }
     }
@@ -1210,12 +1416,34 @@ async function buildProxyRoutes(
       // Uses CPM itself as the auth provider (replaces Authentik)
       const cpmDialAddress = getCpmDialAddress();
       if (cpmDialAddress) {
+        const cpmProxyProof = getForwardAuthProxyProof();
         const CPM_COPY_HEADERS = [
           "X-CPM-User",
           "X-CPM-Email",
           "X-CPM-Groups",
           "X-CPM-User-Id"
         ];
+
+        // Security: strip any client-supplied CPM identity headers from the
+        // inbound request before it ever reaches the upstream. These headers
+        // are injected solely by CPM from the verify response; accepting them
+        // from the client would let a caller spoof their identity / group
+        // membership to upstream apps. This must run on EVERY route — protected,
+        // unprotected catch-all, excluded, and location — because on routes
+        // without the auth handler nothing else would remove them, and on
+        // authenticated routes the copy step below only overwrites a header
+        // when the verify response value is non-empty (e.g. a user in no group
+        // returns an empty X-CPM-Groups, which would otherwise leave the
+        // client's forged value intact).
+        const cpmStripHeadersHandler: Record<string, unknown> = {
+          handler: "headers",
+          request: {
+            delete: [...CPM_COPY_HEADERS]
+          }
+        };
+        // Prepend the strip handler to the shared handler chain for all CPM
+        // forward-auth routes.
+        const cpmHandlers = [cpmStripHeadersHandler, ...handlers];
 
         // Build handle_response routes for copying user headers on 2xx
         const cpmHandleResponseRoutes: Record<string, unknown>[] = [
@@ -1252,8 +1480,9 @@ async function buildProxyRoutes(
               set: {
                 "X-Forwarded-Method": ["{http.request.method}"],
                 "X-Forwarded-Uri": ["{http.request.uri}"],
-                "X-Forwarded-Host": ["{http.request.host}"],
-                "X-Forwarded-Proto": ["{http.request.scheme}"]
+                "X-Forwarded-Host": ["{http.request.hostport}"],
+                "X-Forwarded-Proto": ["{http.request.scheme}"],
+                [FORWARD_AUTH_PROXY_PROOF_HEADER]: [cpmProxyProof]
               }
             }
           },
@@ -1272,7 +1501,7 @@ async function buildProxyRoutes(
                       status_code: 302,
                       headers: {
                         Location: [
-                          `${config.baseUrl}/portal?rd={http.request.scheme}://{http.request.host}{http.request.uri}`
+                          `${config.baseUrl}/portal?rd={http.request.scheme}://{http.request.hostport}{http.request.uri}`
                         ]
                       }
                     }
@@ -1297,8 +1526,9 @@ async function buildProxyRoutes(
               headers: {
                 request: {
                   set: {
-                    "X-Forwarded-Host": ["{http.request.host}"],
-                    "X-Forwarded-Proto": ["{http.request.scheme}"]
+                    "X-Forwarded-Host": ["{http.request.hostport}"],
+                    "X-Forwarded-Proto": ["{http.request.scheme}"],
+                    [FORWARD_AUTH_PROXY_PROOF_HEADER]: [cpmProxyProof]
                   }
                 }
               }
@@ -1320,7 +1550,7 @@ async function buildProxyRoutes(
 
             // Protected paths
             for (const protectedPath of cpmForwardAuth.protected_paths) {
-              const protectedHandlers: Record<string, unknown>[] = [...handlers];
+              const protectedHandlers: Record<string, unknown>[] = [...cpmHandlers];
               const protectedReverseProxy = JSON.parse(JSON.stringify(reverseProxyHandler));
               protectedHandlers.push(cpmForwardAuthHandler);
               protectedHandlers.push(protectedReverseProxy);
@@ -1342,7 +1572,7 @@ async function buildProxyRoutes(
               if (!safePath) continue;
               hostRoutes.push({
                 match: [{ host: domainGroup, path: [safePath] }],
-                handle: [...handlers, locationProxy],
+                handle: [...cpmHandlers, locationProxy],
                 terminal: true
               });
             }
@@ -1350,7 +1580,7 @@ async function buildProxyRoutes(
             // Unprotected catch-all
             hostRoutes.push({
               match: [{ host: domainGroup }],
-              handle: [...handlers, reverseProxyHandler],
+              handle: [...cpmHandlers, reverseProxyHandler],
               terminal: true
             });
           }
@@ -1367,7 +1597,7 @@ async function buildProxyRoutes(
             for (const excludedPath of cpmForwardAuth.excluded_paths) {
               hostRoutes.push({
                 match: [{ host: domainGroup, path: [excludedPath] }],
-                handle: [...handlers, JSON.parse(JSON.stringify(reverseProxyHandler))],
+                handle: [...cpmHandlers, JSON.parse(JSON.stringify(reverseProxyHandler))],
                 terminal: true
               });
             }
@@ -1382,7 +1612,7 @@ async function buildProxyRoutes(
               if (!safePath) continue;
               hostRoutes.push({
                 match: [{ host: domainGroup, path: [safePath] }],
-                handle: [...handlers, cpmForwardAuthHandler, locationProxy],
+                handle: [...cpmHandlers, cpmForwardAuthHandler, locationProxy],
                 terminal: true
               });
             }
@@ -1390,7 +1620,7 @@ async function buildProxyRoutes(
             // Catch-all with auth (everything not excluded)
             hostRoutes.push({
               match: [{ host: domainGroup }],
-              handle: [...handlers, cpmForwardAuthHandler, reverseProxyHandler],
+              handle: [...cpmHandlers, cpmForwardAuthHandler, reverseProxyHandler],
               terminal: true
             });
           }
@@ -1413,7 +1643,7 @@ async function buildProxyRoutes(
               if (!safePath) continue;
               hostRoutes.push({
                 match: [{ host: domainGroup, path: [safePath] }],
-                handle: [...handlers, cpmForwardAuthHandler, locationProxy],
+                handle: [...cpmHandlers, cpmForwardAuthHandler, locationProxy],
                 terminal: true
               });
             }
@@ -1421,7 +1651,7 @@ async function buildProxyRoutes(
             // Main route with forward auth
             hostRoutes.push({
               match: [{ host: domainGroup }],
-              handle: [...handlers, cpmForwardAuthHandler, reverseProxyHandler],
+              handle: [...cpmHandlers, cpmForwardAuthHandler, reverseProxyHandler],
               terminal: true
             });
           }
@@ -1625,9 +1855,17 @@ async function buildProxyRoutes(
     }
 
     routes.push(...hostRoutes);
+
+    // Per-host error pages, scoped to this host's domains. Collected separately so
+    // they can be attached to the server-level `errors` block (handle_errors).
+    if (meta.error_pages && meta.error_pages.length > 0) {
+      for (const rule of meta.error_pages) {
+        errorRoutes.push(buildErrorPageRoute(rule, domains));
+      }
+    }
   }
 
-  return sortRoutesByHostPriority(routes);
+  return { routes: sortRoutesByHostPriority(routes), errorRoutes };
 }
 
 function buildTlsConnectionPolicies(
@@ -1751,10 +1989,10 @@ function buildTlsConnectionPolicies(
   };
 }
 
-async function buildTlsAutomation(
+export async function buildTlsAutomation(
   usage: Map<number, CertificateUsage>,
   autoManagedDomains: Set<string>,
-  options: { acmeEmail?: string; dnsSettings?: DnsSettings | null }
+  options: { acmeEmail?: string; dnsSettings?: DnsSettings | null; acmeSettings?: AcmeSettings | null }
 ) {
   const managedEntries = Array.from(usage.values()).filter(
     (entry) => entry.certificate.type === "managed" && Boolean(entry.certificate.autoRenew)
@@ -1789,12 +2027,27 @@ async function buildTlsAutomation(
   const managedCertificateIds = new Set<number>();
   const policies: Record<string, unknown>[] = [];
 
+  // Custom ACME directory URL + trusted root for internal CAs (OpenBao, Step-CA, etc.)
+  const acmeSettings = options.acmeSettings ?? await getAcmeSettings();
+  const customAcmeUrl = acmeSettings?.caUrl?.trim() || null;
+  const acmeRootPath = syncAcmeCaRootFile(acmeSettings?.caRootPem);
+
+  const applyAcmeOverrides = (issuer: Record<string, unknown>) => {
+    if (customAcmeUrl) {
+      issuer.ca = customAcmeUrl;
+    }
+    if (acmeRootPath) {
+      issuer.trusted_roots_pem_files = [acmeRootPath];
+    }
+  };
+
   // Add policy for auto-managed domains (certificateId = null)
   if (hasAutoManagedDomains) {
     for (const subjects of groupHostPatternsByPriority(Array.from(autoManagedDomains))) {
       const issuer: Record<string, unknown> = {
         module: "acme"
       };
+      applyAcmeOverrides(issuer);
 
       if (options.acmeEmail) {
         issuer.email = options.acmeEmail;
@@ -1841,6 +2094,7 @@ async function buildTlsAutomation(
       const issuer: Record<string, unknown> = {
         module: "acme"
       };
+      applyAcmeOverrides(issuer);
 
       if (options.acmeEmail) {
         issuer.email = options.acmeEmail;
@@ -2085,8 +2339,8 @@ async function buildL4Servers(): Promise<Record<string, unknown> | null> {
   return servers;
 }
 
-async function buildCaddyDocument() {
-  const [proxyHostRecords, certRows, accessListEntryRecords, caCertRows, issuedClientCertRows, allIssuedCaCertIds, allIssuedCertCaMap] = await Promise.all([
+export async function buildCaddyDocument() {
+  const [proxyHostRecords, certRows, accessListEntryRecords, caCertRows, issuedClientCertRows, allIssuedCaCertIds] = await Promise.all([
     db
       .select({
         id: proxyHosts.id,
@@ -2143,15 +2397,6 @@ async function buildCaddyDocument() {
     // (trust any cert signed by that CA).
     db
       .selectDistinct({ caCertificateId: issuedClientCertificates.caCertificateId })
-      .from(issuedClientCertificates),
-    // All issued certs (including revoked) — cert ID → CA ID only.
-    // Used to derive CA IDs for the new trust model even when all certs are revoked,
-    // so the domain stays in mTlsDomainMap and gets a fail-closed mTLS policy.
-    db
-      .select({
-        id: issuedClientCertificates.id,
-        caCertificateId: issuedClientCertificates.caCertificateId
-      })
       .from(issuedClientCertificates)
   ]);
 
@@ -2178,7 +2423,7 @@ async function buildCaddyDocument() {
     type: c.type as "managed" | "imported",
     domainNames: c.domainNames,
     certificatePem: c.certificatePem,
-    privateKeyPem: c.privateKeyPem,
+    privateKeyPem: c.privateKeyPem ? decryptSecret(c.privateKeyPem) : null,
     autoRenew: c.autoRenew ? 1 : 0,
     providerOptions: c.providerOptions
   }));
@@ -2208,8 +2453,6 @@ async function buildCaddyDocument() {
 
   // Build a lookup: issued cert ID → { id, caCertificateId, certificatePem } (active only)
   const issuedCertById = new Map(issuedClientCertRows.map(r => [r.id, r]));
-  // Cert ID → CA ID for ALL certs (including revoked), used to derive CA IDs for fail-closed
-  const certIdToCaId = new Map(allIssuedCertCaMap.map(r => [r.id, r.caCertificateId]));
 
   // Resolve role IDs → cert IDs for trusted_role_ids in mTLS config
   const roleCertIdMap = await buildRoleCertIdMap();
@@ -2248,7 +2491,8 @@ async function buildCaddyDocument() {
     }
 
     if (allCertIds.size > 0) {
-      // New model: derive CAs from resolved cert IDs and collect leaf PEMs
+      // New model: pin trust to the explicitly-selected client certs — derive
+      // their CAs for chain validation and collect the leaf PEMs for pinning.
       const derivedCaIds = new Set<number>();
       const leafPems: string[] = [];
       for (const certId of allCertIds) {
@@ -2258,27 +2502,42 @@ async function buildCaddyDocument() {
           leafPems.push(cert.certificatePem);
         }
       }
-      if (derivedCaIds.size === 0) {
-        // All referenced certs are revoked — derive CAs from the full cert map
-        // (including revoked) so the domain stays in mTlsDomainMap and gets a
-        // fail-closed mTLS policy via buildClientAuthentication.
-        for (const certId of allCertIds) {
-          const caId = certIdToCaId.get(certId);
-          if (caId !== undefined) derivedCaIds.add(caId);
-        }
-        if (derivedCaIds.size === 0) continue;
-      }
-      const caIdArr = Array.from(derivedCaIds);
-      for (const domain of domains) {
-        mTlsDomainMap.set(domain, caIdArr);
-        if (leafPems.length > 0) {
+      if (leafPems.length > 0) {
+        const caIdArr = Array.from(derivedCaIds);
+        for (const domain of domains) {
+          mTlsDomainMap.set(domain, caIdArr);
           mTlsDomainLeafOverride.set(domain, leafPems);
+        }
+      } else {
+        // Every explicitly-selected cert/role resolved to ZERO active leaves
+        // (all revoked or deleted). FAIL CLOSED with a deny-all (drop) policy.
+        // Do NOT derive the CA and fall back to whole-CA trust: that would trust
+        // other active certs of the same CA that were never assigned to this
+        // host (and "request" mode would accept any presented cert). Force
+        // require_and_verify with an empty trust set → buildClientAuthentication
+        // returns null → buildTlsConnectionPolicies emits a drop-all policy.
+        for (const domain of domains) {
+          mTlsDomainMap.set(domain, []);
+          mTlsOptionalAuthDomains.delete(domain);
         }
       }
     } else if (meta.mtls.ca_certificate_ids?.length) {
       // Legacy model: trust entire CAs (backward compat)
       for (const domain of domains) {
         mTlsDomainMap.set(domain, meta.mtls.ca_certificate_ids);
+      }
+    } else {
+      // mTLS is enabled but no trust resolved — e.g. trust is role-only and
+      // every cert in those roles was revoked or the role is empty, or nothing
+      // was selected — and there is no legacy CA trust. FAIL CLOSED: keep the
+      // domain in the mTLS map with an empty CA set (buildClientAuthentication
+      // returns null → buildTlsConnectionPolicies emits a drop-all policy) and
+      // force require_and_verify so even protected/excluded-path hosts reject
+      // all connections rather than silently serving the backend with no client
+      // certificate required.
+      for (const domain of domains) {
+        mTlsDomainMap.set(domain, []);
+        mTlsOptionalAuthDomains.delete(domain);
       }
     }
   }
@@ -2292,16 +2551,31 @@ async function buildCaddyDocument() {
   ]);
 
   const { usage: certificateUsage, autoManagedDomains } = collectCertificateUsage(proxyHostRows, certificateMap);
-  const [generalSettings, dnsSettings, upstreamDnsResolutionSettings, globalGeoBlock, globalWaf] = await Promise.all([
+  const [generalSettings, acmeSettings, dnsSettings, upstreamDnsResolutionSettings, globalGeoBlock, globalWaf, trustedProxiesSettings, defaultResponseSettings] = await Promise.all([
     getGeneralSettings(),
+    getAcmeSettings(),
     getDnsSettings(),
     getUpstreamDnsResolutionSettings(),
     getGeoBlockSettings(),
-    getWafSettings()
+    getWafSettings(),
+    getTrustedProxiesSettings(),
+    getDefaultResponseSettings()
   ]);
+
+  // Optionally seed the global geoblock trusted-proxy list from the server-level
+  // value so the two can't silently disagree (issue #222). Only applied as a
+  // default: an explicit per-scope geoblock list is left untouched.
+  let effectiveGlobalGeoBlock = globalGeoBlock;
+  if (trustedProxiesSettings?.default_geoblock && globalGeoBlock) {
+    const serverRanges = (trustedProxiesSettings.ranges ?? []).map((r) => r.trim()).filter(Boolean);
+    if (serverRanges.length > 0 && !(globalGeoBlock.trusted_proxies?.length)) {
+      effectiveGlobalGeoBlock = { ...globalGeoBlock, trusted_proxies: serverRanges };
+    }
+  }
   const { tlsApp, managedCertificateIds } = await buildTlsAutomation(certificateUsage, autoManagedDomains, {
     acmeEmail: generalSettings?.acmeEmail,
-    dnsSettings
+    dnsSettings,
+    acmeSettings
   });
   const { policies: tlsConnectionPolicies, readyCertificates, importedCertPems } = buildTlsConnectionPolicies(
     certificateUsage,
@@ -2315,14 +2589,14 @@ async function buildCaddyDocument() {
     mTlsOptionalAuthDomains
   );
 
-  const httpRoutes: CaddyHttpRoute[] = await buildProxyRoutes(
+  const { routes: httpRoutes, errorRoutes: hostErrorRoutes } = await buildProxyRoutes(
     proxyHostRows,
     accessMap,
     readyCertificates,
     {
       globalDnsSettings: dnsSettings,
       globalUpstreamDnsResolutionSettings: upstreamDnsResolutionSettings,
-      globalGeoBlock,
+      globalGeoBlock: effectiveGlobalGeoBlock,
       globalWaf,
       mtlsRbac: {
         roleFingerprintMap,
@@ -2331,6 +2605,18 @@ async function buildCaddyDocument() {
       },
     }
   );
+
+  // An administrator-configured matcher-less route replaces Caddy's native
+  // unmatched-request behavior and must remain last so it cannot shadow any
+  // managed proxy host.
+  const defaultResponseRoute = buildDefaultResponseRoute(defaultResponseSettings);
+  const mainRoutes = defaultResponseRoute ? [...httpRoutes, defaultResponseRoute] : httpRoutes;
+
+  // Server-level error routes (Caddy handle_errors): per-host rules first so they
+  // take precedence, then global rules act as a fallback for any unmatched host/status.
+  const globalErrorPages = await getErrorPagesSettings();
+  const globalErrorRoutes = (globalErrorPages?.rules ?? []).map((rule) => buildErrorPageRoute(rule));
+  const errorRoutes: CaddyHttpRoute[] = [...hostErrorRoutes, ...globalErrorRoutes];
 
   const hasTls = tlsConnectionPolicies.length > 0;
 
@@ -2346,15 +2632,24 @@ async function buildCaddyDocument() {
 
   const servers: Record<string, unknown> = {};
 
+  // Server-level trusted proxies / client-IP headers. Caddy resolves client_ip
+  // in core before any handler, so this is the only place a global list fixes
+  // client-IP attribution for access logs, analytics and downstream handlers.
+  const serverTrustedProxies = buildServerTrustedProxies(trustedProxiesSettings);
+
   // Main HTTP/HTTPS server for proxy hosts
-  if (httpRoutes.length > 0) {
+  if (mainRoutes.length > 0) {
     servers.cpm = {
       listen: hasTls ? [":80", ":443"] : [":80"],
-      routes: httpRoutes,
+      routes: mainRoutes,
       // Only disable automatic HTTPS if we have TLS automation policies
       // This allows Caddy to handle HTTP-01 challenges for managed certificates
       ...(tlsApp ? {} : { automatic_https: { disable: true } }),
       ...(hasTls ? { tls_connection_policies: tlsConnectionPolicies } : {}),
+      // Custom error pages (handle_errors)
+      ...(errorRoutes.length > 0 ? { errors: { routes: errorRoutes } } : {}),
+      // Trusted proxies / client_ip_headers / trusted_proxies_strict (issue #222)
+      ...serverTrustedProxies,
       // Enable access logging if configured
       ...(loggingEnabled ? { logs: { default_logger_name: "http_access" } } : {})
     };
@@ -2383,12 +2678,27 @@ async function buildCaddyDocument() {
   const httpApp = Object.keys(servers).length > 0 ? { http: { servers } } : {};
 
   // Build logging configuration
+  // Roll settings are spelled out explicitly rather than relying on Caddy's
+  // built-in file-writer defaults — those defaults silently stopped rotating
+  // (no compression, no cleanup of old rolled files) on the deployed build,
+  // filling the host disk. Being explicit is defensive against future
+  // upstream default/behavior changes.
+  const rollSettings = {
+    roll: true,
+    roll_size_mb: 100,
+    roll_gzip: true,
+    roll_keep: 10,
+    roll_keep_days: 30
+  };
   const loggingLogs: Record<string, unknown> = {
-    // Always capture WAF rule match logs so the waf-log-parser can extract rule details.
-    // Coraza does not write matched rules to the audit log (known bug), but it does emit
-    // structured JSON lines via the http.handlers.waf logger for each matched rule.
+    // WAF rule match logs. Modern Coraza puts the matched rules directly in the
+    // audit log (part H), and waf-log-parser reads them from there — this file is
+    // only a fallback for older builds that leave `messages` empty, plus a
+    // human-readable trail. Do not make event ingestion depend on it: correlating
+    // two independently-written files only works when both land in the same parse
+    // tick, which silently dropped every non-blocked event (issue #233).
     waf_rules: {
-      writer: { output: "file", filename: "/logs/waf-rules.log", mode: "0640" },
+      writer: { output: "file", filename: "/logs/waf-rules.log", mode: "0640", ...rollSettings },
       encoder: { format: "json" },
       include: ["http.handlers.waf"],
       level: "ERROR"
@@ -2396,7 +2706,7 @@ async function buildCaddyDocument() {
   };
   if (loggingEnabled) {
     loggingLogs.http_access = {
-      writer: { output: "file", filename: "/logs/access.log", mode: "0640" },
+      writer: { output: "file", filename: "/logs/access.log", mode: "0640", ...rollSettings },
       encoder: { format: loggingFormat },
       include: ["http.log.access", "http.handlers.blocker"]
     };
@@ -2463,29 +2773,39 @@ export async function applyCaddyConfig() {
   const hash = crypto.createHash("sha256").update(payload).digest("hex");
   setSetting("caddy_config_hash", { hash, updatedAt: nowIso() });
 
+  let response: { status: number; text: string };
   try {
-    const response = await caddyRequest(`${config.caddyApiUrl}/load`, "POST", payload);
-
-    if (response.status < 200 || response.status >= 300) {
-      throw new Error(`Caddy config load failed: ${response.status} ${response.text}`);
+    response = await caddyRequest(`${config.caddyApiUrl}/load`, "POST", payload);
+  } catch (error) {
+    const systemCode = safeSystemErrorCode(error);
+    logCaddyApplyFailure("Caddy admin request failed", error);
+    if (systemCode === "ENOTFOUND" || systemCode === "ECONNREFUSED") {
+      throw new CaddyApplyError("Unable to reach Caddy API", "CADDY_UNREACHABLE");
     }
+    throw new CaddyApplyError("Failed to apply Caddy configuration", "CADDY_REQUEST_FAILED");
+  }
 
+  if (response.status < 200 || response.status >= 300) {
+    const reason = describeCaddyRejection(response.text);
+    logCaddyApplyFailure("Caddy rejected configuration", undefined, {
+      status: response.status,
+      responseBytes: Buffer.byteLength(response.text),
+      knownReason: reason !== null,
+    });
+    throw new CaddyApplyError(
+      reason ? `Caddy rejected configuration: ${reason}` : "Caddy rejected configuration",
+      "CADDY_REJECTED"
+    );
+  }
+
+  try {
     await syncInstances();
   } catch (error) {
-    console.error("Failed to apply Caddy config", error);
-
-    // Check if it's a fetch error with ECONNREFUSED or ENOTFOUND
-    const err = error as { cause?: NodeJS.ErrnoException };
-    const causeCode = err?.cause?.code;
-
-    if (causeCode === "ENOTFOUND" || causeCode === "ECONNREFUSED") {
-      throw new Error(
-        `Unable to reach Caddy API at ${config.caddyApiUrl}. Ensure Caddy is running and accessible.`,
-        { cause: error }
-      );
-    }
-
-    throw error;
+    logCaddyApplyFailure("Instance synchronization failed after Caddy apply", error);
+    throw new CaddyApplyError(
+      "Caddy configuration applied but instance synchronization failed",
+      "INSTANCE_SYNC_FAILED"
+    );
   }
 }
 

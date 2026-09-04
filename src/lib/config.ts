@@ -1,3 +1,5 @@
+import { assertValidInstanceSyncToken } from "./instance-sync-token";
+
 const DEV_SECRET = "dev-secret-change-in-production-12345678901234567890123456789012";
 const DEFAULT_ADMIN_USERNAME = "admin";
 const DEFAULT_ADMIN_PASSWORD = "admin";
@@ -167,6 +169,16 @@ export const config = {
   get adminPassword() {
     return getAdminCredentials().password;
   },
+  auth: {
+    allowSelfRegistration: process.env.AUTH_ALLOW_SELF_REGISTRATION === "true",
+    // Separate from credential self-registration: gates whether an OAuth
+    // sign-in may implicitly create a brand-new account. Defaults to closed.
+    allowOauthRegistration: process.env.AUTH_ALLOW_OAUTH_REGISTRATION === "true",
+    // When true, an OAuth IdP's profile claims may set a new user's role/status.
+    // Defaults to false: role/status are forced to safe defaults regardless of
+    // claims. Only enable if you control the IdP and want it to manage roles.
+    allowOauthRoleFromClaims: process.env.AUTH_ALLOW_OAUTH_ROLE_FROM_CLAIMS === "true",
+  },
   oauth: {
     enabled: process.env.OAUTH_ENABLED === "true",
     providerName: process.env.OAUTH_PROVIDER_NAME ?? "OAuth2",
@@ -194,27 +206,14 @@ export function validateProductionConfig() {
     void config.sessionSecret;
     void config.adminUsername;
     void config.adminPassword;
+
+    // An environment-configured slave cannot safely fall back to a short or
+    // missing bearer credential. Validate this synchronously during startup.
+    if (process.env.INSTANCE_MODE === "slave") {
+      assertValidInstanceSyncToken(
+        process.env.INSTANCE_SYNC_TOKEN,
+        "INSTANCE_SYNC_TOKEN for slave mode"
+      );
+    }
   }
-}
-
-/**
- * Returns list of enabled OAuth providers based on configuration.
- * Only includes providers that have complete credentials configured.
- */
-export function getEnabledOAuthProviders(): Array<{id: string; name: string}> {
-  const providers: Array<{id: string; name: string}> = [];
-
-  if (
-    config.oauth.enabled &&
-    config.oauth.clientId &&
-    config.oauth.clientSecret &&
-    config.oauth.issuer
-  ) {
-    providers.push({
-      id: "oauth2",
-      name: config.oauth.providerName
-    });
-  }
-
-  return providers;
 }

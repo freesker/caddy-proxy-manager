@@ -1,12 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireApiAdmin, apiErrorResponse } from "@/src/lib/api-auth";
 import { listCertificates, createCertificate } from "@/src/lib/models/certificates";
+import { toCertificateApiResponse } from "@/src/lib/certificate-api";
+
+const PRIVATE_RESPONSE_INIT = { headers: { "Cache-Control": "no-store" } };
 
 export async function GET(request: NextRequest) {
   try {
     await requireApiAdmin(request);
     const certs = await listCertificates();
-    return NextResponse.json(certs);
+    return NextResponse.json(certs.map(toCertificateApiResponse), PRIVATE_RESPONSE_INIT);
   } catch (error) {
     return apiErrorResponse(error);
   }
@@ -17,7 +20,10 @@ export async function POST(request: NextRequest) {
     const { userId } = await requireApiAdmin(request);
     const body = await request.json();
     const cert = await createCertificate(body, userId);
-    return NextResponse.json(cert, { status: 201 });
+    return NextResponse.json(toCertificateApiResponse(cert), {
+      status: 201,
+      headers: PRIVATE_RESPONSE_INIT.headers,
+    });
   } catch (error) {
     return apiErrorResponse(error);
   }

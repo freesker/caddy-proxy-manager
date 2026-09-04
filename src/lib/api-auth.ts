@@ -1,6 +1,8 @@
 import { type NextRequest, NextResponse } from "next/server";
 import { auth, checkSameOrigin } from "./auth";
 import { validateToken } from "./models/api-tokens";
+import { randomUUID } from "node:crypto";
+import { ApiClientError } from "./api-errors";
 
 export class ApiAuthError extends Error {
   status: number;
@@ -98,14 +100,48 @@ export function apiErrorResponse(error: unknown): NextResponse {
   if (error instanceof ApiAuthError) {
     return NextResponse.json({ error: error.message }, { status: error.status });
   }
+  if (error instanceof ApiClientError) {
+    return NextResponse.json({ error: error.message }, { status: error.status });
+  }
   if (error instanceof NotFoundError) {
     return NextResponse.json({ error: error.message }, { status: 404 });
   }
-  if (error instanceof Error && error.message.toLowerCase().includes("not found")) {
-    return NextResponse.json({ error: error.message }, { status: 404 });
+  // Several model functions predate NotFoundError and use a fixed
+  // "<resource> not found" message. Preserve their 404 contract without
+  // reflecting the unexpected message (or any resource/internal detail).
+  if (error instanceof Error && error.message.trim().toLowerCase().endsWith("not found")) {
+    return NextResponse.json({ error: "Resource not found" }, { status: 404 });
   }
+  const errorId = logUnexpectedApiError("Unhandled API error", error);
   return NextResponse.json(
-    { error: error instanceof Error ? error.message : "Internal server error" },
+    { error: "Internal server error", errorId },
     { status: 500 }
   );
+}
+
+/**
+ * Log enough metadata to correlate unexpected failures without copying raw
+ * exception messages, response bodies, URLs, or stacks into centralized logs.
+ */
+export function logUnexpectedApiError(context: string, error: unknown): string {
+  const errorId = randomUUID();
+  const rawType = error instanceof Error ? error.name : typeof error;
+  const errorType = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(rawType)
+    ? rawType
+    : error instanceof Error ? "Error" : "unknown";
+  const safeDetails: Record<string, unknown> = {
+    errorId,
+    context,
+    errorType,
+  };
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === "string" && /^[A-Z0-9_-]{1,64}$/.test(code)) {
+      safeDetails.code = code;
+    } else if (typeof code === "number" && Number.isFinite(code)) {
+      safeDetails.code = code;
+    }
+  }
+  console.error("Unexpected API failure", safeDetails);
+  return errorId;
 }

@@ -12,13 +12,18 @@ test.describe('API Docs page', () => {
     await expect(page).not.toHaveURL(/login/);
   });
 
-  test('Swagger UI container is present on the page', async ({ page }) => {
+  test('bundled Swagger UI renders without loading executable CDN assets', async ({ page }) => {
     await page.goto('/api-docs');
-
-    // The ApiDocsClient renders a div that Swagger UI mounts into.
-    // The CDN script may be blocked in test environments, so just verify
-    // the page loaded without error and the mount container exists.
-    await expect(page.locator('main')).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator('.swagger-ui')).toBeVisible({ timeout: 10_000 });
+    const thirdPartyScripts = await page.evaluate(() =>
+      performance
+        .getEntriesByType('resource')
+        .filter((entry) => entry instanceof PerformanceResourceTiming)
+        .filter((entry) => entry.initiatorType === 'script')
+        .map((entry) => entry.name)
+        .filter((url) => new URL(url).origin !== window.location.origin)
+    );
+    expect(thirdPartyScripts).toEqual([]);
   });
 
   test('OpenAPI spec endpoint returns valid JSON', async ({ request }) => {

@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireApiAdmin, apiErrorResponse } from "@/src/lib/api-auth";
 import { getCertificate, updateCertificate, deleteCertificate } from "@/src/lib/models/certificates";
+import { toCertificateApiResponse } from "@/src/lib/certificate-api";
+
+const PRIVATE_RESPONSE_INIT = { headers: { "Cache-Control": "no-store" } };
 
 export async function GET(
   request: NextRequest,
@@ -13,7 +16,7 @@ export async function GET(
     if (!cert) {
       return NextResponse.json({ error: "Not found" }, { status: 404 });
     }
-    return NextResponse.json(cert);
+    return NextResponse.json(toCertificateApiResponse(cert), PRIVATE_RESPONSE_INIT);
   } catch (error) {
     return apiErrorResponse(error);
   }
@@ -28,7 +31,7 @@ export async function PUT(
     const { id } = await params;
     const body = await request.json();
     const cert = await updateCertificate(Number(id), body, userId);
-    return NextResponse.json(cert);
+    return NextResponse.json(toCertificateApiResponse(cert), PRIVATE_RESPONSE_INIT);
   } catch (error) {
     return apiErrorResponse(error);
   }

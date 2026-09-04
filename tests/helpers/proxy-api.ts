@@ -136,7 +136,7 @@ export async function createProxyHost(page: Page, config: ProxyHostConfig): Prom
     Object.assign(extraFields, {
       wafPresent: 'on',
       wafEnabled: 'on',
-      wafEngineMode: 'On',    // blocking mode
+      wafEngineMode: 'On',    // blocking mode (the host form only accepts On/Off)
       wafLoadOwaspCrs: config.wafLoadOwaspCrs === false ? '' : 'on',
       wafMode: config.wafMode ?? 'override',
       wafCustomDirectives: config.wafCustomDirectives ?? '',

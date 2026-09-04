@@ -70,4 +70,34 @@ describe('GET /api/v1/openapi.json', () => {
     expect(data.components.schemas).toBeDefined();
     expect(Object.keys(data.components.schemas).length).toBeGreaterThan(0);
   });
+
+  it('documents DNS credentials and certificate private keys as write-only', async () => {
+    const response = await GET(makeRequest());
+    const data = await response.json();
+
+    const certificateOutput = data.components.schemas.Certificate.properties;
+    const certificateInput = data.components.schemas.CertificateInput.properties;
+    expect(certificateOutput.privateKeyPem).toBeUndefined();
+    expect(certificateOutput.hasPrivateKey).toBeDefined();
+    expect(certificateOutput.providerOptions.additionalProperties).toBe(false);
+    expect(certificateInput.providerOptions.additionalProperties).toBe(false);
+    expect(certificateInput.privateKeyPem).toBeDefined();
+    expect(certificateInput.privateKeyPem.writeOnly).toBe(true);
+    expect(data.components.schemas.CloudflareSettings.properties.apiToken.writeOnly).toBe(true);
+    expect(
+      data.components.schemas.DnsProviderSettings.properties.providers
+        .additionalProperties.additionalProperties.writeOnly
+    ).toBe(true);
+
+    const getSettingsSchemas = data.paths['/api/v1/settings/{group}'].get
+      .responses['200'].content['application/json'].schema.oneOf;
+    const putSettingsSchemas = data.paths['/api/v1/settings/{group}'].put
+      .requestBody.content['application/json'].schema.oneOf;
+    expect(getSettingsSchemas).toContainEqual({ $ref: '#/components/schemas/DnsProviderStatus' });
+    expect(getSettingsSchemas).not.toContainEqual({ $ref: '#/components/schemas/DnsProviderSettings' });
+    expect(putSettingsSchemas).toContainEqual({ $ref: '#/components/schemas/DnsProviderSettings' });
+    expect(getSettingsSchemas).toContainEqual({ $ref: '#/components/schemas/CloudflareStatus' });
+    expect(getSettingsSchemas).not.toContainEqual({ $ref: '#/components/schemas/CloudflareSettings' });
+    expect(putSettingsSchemas).toContainEqual({ $ref: '#/components/schemas/CloudflareSettings' });
+  });
 });

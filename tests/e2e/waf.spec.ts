@@ -4,8 +4,10 @@ test.describe('WAF', () => {
   test('WAF events period filters support presets, custom range, and reset to all time', async ({ page }) => {
     const customFrom = '2026-05-01T09:00';
     const customTo = '2026-05-02T09:30';
-    const expectedFrom = Math.floor(new Date(customFrom).getTime() / 1000);
-    const expectedTo = Math.floor(new Date(customTo).getTime() / 1000);
+    // The WAF page pins datetime-local values to UTC (see parseDateTimeLocalUtc),
+    // so compute the expected epochs in UTC rather than the runner's timezone.
+    const expectedFrom = Math.floor(new Date(`${customFrom}Z`).getTime() / 1000);
+    const expectedTo = Math.floor(new Date(`${customTo}Z`).getTime() / 1000);
 
     await page.goto('/waf');
 

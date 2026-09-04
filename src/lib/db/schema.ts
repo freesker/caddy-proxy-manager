@@ -51,6 +51,7 @@ export const accounts = sqliteTable(
     userId: integer("userId")
       .references(() => users.id, { onDelete: "cascade" })
       .notNull(),
+    issuer: text("issuer").notNull(),
     accountId: text("accountId").notNull(),
     providerId: text("providerId").notNull(),
     accessToken: text("accessToken"),
@@ -64,7 +65,7 @@ export const accounts = sqliteTable(
     updatedAt: text("updatedAt").notNull()
   },
   (table) => ({
-    providerAccountIdx: uniqueIndex("accounts_provider_account_idx").on(table.providerId, table.accountId),
+    issuerAccountIdx: uniqueIndex("accounts_issuer_account_idx").on(table.issuer, table.accountId),
     userIdx: index("accounts_user_idx").on(table.userId)
   })
 );
@@ -450,6 +451,10 @@ export const forwardAuthSessions = sqliteTable(
     userId: integer("userId")
       .references(() => users.id, { onDelete: "cascade" })
       .notNull(),
+    proxyHostId: integer("proxyHostId")
+      .references(() => proxyHosts.id, { onDelete: "cascade" })
+      .notNull(),
+    audienceOrigin: text("audienceOrigin").notNull(),
     tokenHash: text("tokenHash").notNull(),
     expiresAt: text("expiresAt").notNull(),
     createdAt: text("createdAt").notNull()
@@ -457,6 +462,7 @@ export const forwardAuthSessions = sqliteTable(
   (table) => ({
     tokenHashUnique: uniqueIndex("fas_token_hash_unique").on(table.tokenHash),
     userIdx: index("fas_user_idx").on(table.userId),
+    proxyHostIdx: index("fas_proxy_host_idx").on(table.proxyHostId),
     expiresIdx: index("fas_expires_idx").on(table.expiresAt)
   })
 );
@@ -468,8 +474,14 @@ export const forwardAuthExchanges = sqliteTable(
     sessionId: integer("sessionId")
       .references(() => forwardAuthSessions.id, { onDelete: "cascade" })
       .notNull(),
+    proxyHostId: integer("proxyHostId")
+      .references(() => proxyHosts.id, { onDelete: "cascade" })
+      .notNull(),
+    audienceOrigin: text("audienceOrigin").notNull(),
     codeHash: text("codeHash").notNull(),
-    sessionToken: text("sessionToken").notNull(), // raw session token (short-lived, single-use)
+    // Legacy compatibility column. Only a fixed placeholder is stored; the
+    // replacement session token is generated at atomic redemption time.
+    sessionToken: text("sessionToken").notNull(),
     redirectUri: text("redirectUri").notNull(),
     expiresAt: text("expiresAt").notNull(),
     used: integer("used", { mode: "boolean" }).notNull().default(false),
@@ -485,6 +497,10 @@ export const forwardAuthRedirectIntents = sqliteTable(
   {
     id: integer("id").primaryKey({ autoIncrement: true }),
     ridHash: text("ridHash").notNull(),
+    proxyHostId: integer("proxyHostId")
+      .references(() => proxyHosts.id, { onDelete: "cascade" })
+      .notNull(),
+    audienceOrigin: text("audienceOrigin").notNull(),
     redirectUri: text("redirectUri").notNull(),
     expiresAt: text("expiresAt").notNull(),
     consumed: integer("consumed", { mode: "boolean" }).notNull().default(false),

@@ -5,6 +5,10 @@ import { eq, ne, and, isNull } from "drizzle-orm";
 import { mkdirSync } from "node:fs";
 import { dirname, isAbsolute, resolve as resolvePath } from "node:path";
 import * as schema from "./db/schema";
+import {
+  CREDENTIAL_ACCOUNT_ISSUER,
+  resolveOAuthAccountIssuer,
+} from "./account-issuer";
 
 const DEFAULT_SQLITE_URL = "file:./data/caddy-proxy-manager.db";
 
@@ -24,7 +28,7 @@ function resolveSqlitePath(rawUrl: string): string {
 
   if (rawUrl.startsWith("file:./") || rawUrl.startsWith("file:../")) {
     const relative = rawUrl.slice("file:".length);
-    return resolvePath(process.cwd(), relative);
+    return resolvePath(/* turbopackIgnore: true */ process.cwd(), relative);
   }
 
   if (rawUrl.startsWith("file:")) {
@@ -39,11 +43,15 @@ function resolveSqlitePath(rawUrl: string): string {
       if (!remainder) {
         return ":memory:";
       }
-      return isAbsolute(remainder) ? remainder : resolvePath(process.cwd(), remainder);
+      return isAbsolute(remainder)
+        ? remainder
+        : resolvePath(/* turbopackIgnore: true */ process.cwd(), remainder);
     }
   }
 
-  return isAbsolute(rawUrl) ? rawUrl : resolvePath(process.cwd(), rawUrl);
+  return isAbsolute(rawUrl)
+    ? rawUrl
+    : resolvePath(/* turbopackIgnore: true */ process.cwd(), rawUrl);
 }
 
 const databaseUrl = process.env.DATABASE_URL ?? DEFAULT_SQLITE_URL;
@@ -159,41 +167,152 @@ function fixSessionsSchema() {
 function fixAccountsSchema() {
   try {
     const cols = db.$client.prepare('PRAGMA table_info("accounts")').all() as Array<{
-      name: string; type: string; pk: number;
+      name: string; type: string; notnull: number; pk: number;
     }>;
     if (cols.length === 0) return;
     const idCol = cols.find((c) => c.name === 'id');
     if (!idCol) return;
-    if (idCol.type.toUpperCase() === 'INTEGER' && idCol.pk === 1) return;
+    const issuerCol = cols.find((c) => c.name === "issuer");
+    const indexes = db.$client.prepare('PRAGMA index_list("accounts")').all() as Array<{
+      name: string;
+      unique: number;
+    }>;
+    const issuerIndex = indexes.find(
+      (index) => index.name === "accounts_issuer_account_idx" && index.unique === 1
+    );
+    const issuerIndexColumns = issuerIndex
+      ? db.$client.prepare('PRAGMA index_info("accounts_issuer_account_idx")').all() as Array<{
+          name: string;
+          seqno: number;
+        }>
+      : [];
+    const hasCorrectIssuerIndex = issuerIndexColumns
+      .sort((left, right) => left.seqno - right.seqno)
+      .map((column) => column.name)
+      .join(",") === "issuer,accountId";
+    const hasLegacyProviderIndex = indexes.some(
+      (index) => index.name === "accounts_provider_account_idx"
+    );
+    const idIsCorrect = idCol.type.toUpperCase() === "INTEGER" && idCol.pk === 1;
+    const issuerIsCorrect = issuerCol?.notnull === 1;
 
-    db.$client.prepare(`CREATE TABLE "accounts_patch" (
-      "id" INTEGER PRIMARY KEY AUTOINCREMENT,
-      "userId" INTEGER NOT NULL REFERENCES "users"("id") ON DELETE CASCADE,
-      "accountId" TEXT NOT NULL,
-      "providerId" TEXT NOT NULL,
-      "accessToken" TEXT,
-      "refreshToken" TEXT,
-      "idToken" TEXT,
-      "accessTokenExpiresAt" TEXT,
-      "refreshTokenExpiresAt" TEXT,
-      "scope" TEXT,
-      "password" TEXT,
-      "createdAt" TEXT NOT NULL,
-      "updatedAt" TEXT NOT NULL
-    )`).run();
-    db.$client.prepare(`INSERT INTO "accounts_patch" (
-      "userId", "accountId", "providerId", "accessToken", "refreshToken", "idToken",
-      "accessTokenExpiresAt", "refreshTokenExpiresAt", "scope", "password", "createdAt", "updatedAt"
-    ) SELECT
-      "userId", "accountId", "providerId", "accessToken", "refreshToken", "idToken",
-      "accessTokenExpiresAt", "refreshTokenExpiresAt", "scope", "password", "createdAt", "updatedAt"
-    FROM "accounts"`).run();
-    db.$client.prepare('DROP TABLE "accounts"').run();
-    db.$client.prepare('ALTER TABLE "accounts_patch" RENAME TO "accounts"').run();
-    db.$client.prepare('CREATE UNIQUE INDEX IF NOT EXISTS "accounts_provider_account_idx" ON "accounts" ("providerId", "accountId")').run();
-    db.$client.prepare('CREATE INDEX IF NOT EXISTS "accounts_user_idx" ON "accounts" ("userId")').run();
-  } catch {
-    // ignore
+    if (idIsCorrect && issuerIsCorrect && hasCorrectIssuerIndex && !hasLegacyProviderIndex) {
+      return;
+    }
+
+    type LegacyAccountRow = {
+      id: number | string;
+      userId: number;
+      issuer?: string | null;
+      accountId: string;
+      providerId: string;
+      accessToken: string | null;
+      refreshToken: string | null;
+      idToken: string | null;
+      accessTokenExpiresAt: string | null;
+      refreshTokenExpiresAt: string | null;
+      scope: string | null;
+      password: string | null;
+      createdAt: string;
+      updatedAt: string;
+    };
+
+    const accountRows = db.$client
+      .prepare('SELECT * FROM "accounts" ORDER BY "id"')
+      .all() as LegacyAccountRow[];
+    const providerIssuers = new Map<string, string | null>();
+    const hasProviderTable = db.$client
+      .prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'oauth_providers'")
+      .get();
+    if (hasProviderTable) {
+      const providers = db.$client
+        .prepare('SELECT "id", "issuer" FROM "oauth_providers"')
+        .all() as Array<{ id: string; issuer: string | null }>;
+      for (const provider of providers) {
+        providerIssuers.set(provider.id, provider.issuer);
+      }
+    }
+
+    const normalizedRows = accountRows.map((row) => {
+      const existingIssuer = row.issuer?.trim();
+      const issuer = existingIssuer || (
+        row.providerId === "credential"
+          ? CREDENTIAL_ACCOUNT_ISSUER
+          : resolveOAuthAccountIssuer(row.providerId, providerIssuers.get(row.providerId))
+      );
+      return { ...row, issuer };
+    });
+
+    // Better Auth 1.7 keys external identities by (issuer, accountId). Never
+    // merge a collision implicitly: two legacy rows may belong to different
+    // users, and choosing either one could turn a migration into account takeover.
+    const identityOwners = new Map<string, number | string>();
+    for (const row of normalizedRows) {
+      const key = JSON.stringify([row.issuer, row.accountId]);
+      const existingOwner = identityOwners.get(key);
+      if (existingOwner !== undefined) {
+        throw new Error(
+          `account identity collision for issuer "${row.issuer}" and accountId "${row.accountId}"`
+        );
+      }
+      identityOwners.set(key, row.id);
+    }
+
+    const repair = db.$client.transaction(() => {
+      db.$client.prepare('DROP TABLE IF EXISTS "accounts_patch"').run();
+      db.$client.prepare(`CREATE TABLE "accounts_patch" (
+        "id" INTEGER PRIMARY KEY AUTOINCREMENT,
+        "userId" INTEGER NOT NULL REFERENCES "users"("id") ON DELETE CASCADE,
+        "issuer" TEXT NOT NULL,
+        "accountId" TEXT NOT NULL,
+        "providerId" TEXT NOT NULL,
+        "accessToken" TEXT,
+        "refreshToken" TEXT,
+        "idToken" TEXT,
+        "accessTokenExpiresAt" TEXT,
+        "refreshTokenExpiresAt" TEXT,
+        "scope" TEXT,
+        "password" TEXT,
+        "createdAt" TEXT NOT NULL,
+        "updatedAt" TEXT NOT NULL
+      )`).run();
+      const insert = db.$client.prepare(`INSERT INTO "accounts_patch" (
+        "id", "userId", "issuer", "accountId", "providerId", "accessToken", "refreshToken", "idToken",
+        "accessTokenExpiresAt", "refreshTokenExpiresAt", "scope", "password", "createdAt", "updatedAt"
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      for (const row of normalizedRows) {
+        insert.run(
+          row.id,
+          row.userId,
+          row.issuer,
+          row.accountId,
+          row.providerId,
+          row.accessToken,
+          row.refreshToken,
+          row.idToken,
+          row.accessTokenExpiresAt,
+          row.refreshTokenExpiresAt,
+          row.scope,
+          row.password,
+          row.createdAt,
+          row.updatedAt
+        );
+      }
+      db.$client.prepare('DROP TABLE "accounts"').run();
+      db.$client.prepare('ALTER TABLE "accounts_patch" RENAME TO "accounts"').run();
+      db.$client.prepare(
+        'CREATE UNIQUE INDEX "accounts_issuer_account_idx" ON "accounts" ("issuer", "accountId")'
+      ).run();
+      db.$client.prepare(
+        'CREATE INDEX "accounts_user_idx" ON "accounts" ("userId")'
+      ).run();
+    });
+    repair();
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "unknown error";
+    throw new Error(`Failed to repair Better Auth accounts schema: ${detail}`, {
+      cause: error,
+    });
   }
 }
 
@@ -282,9 +401,10 @@ try {
   runMigrations();
 } catch (error) {
   console.error("Failed to run database migrations:", error);
-  // In build mode, allow the build to continue even if migrations fail
-  // The runtime initialization will handle migrations properly
-  if (process.env.NODE_ENV !== 'production' || process.env.NEXT_PHASE === 'phase-production-build') {
+  // Next's production build can import this module from parallel workers that
+  // share the temporary build database. Runtime, development, and tests must
+  // fail closed on migration errors so identity collisions are never ignored.
+  if (process.env.NEXT_PHASE === 'phase-production-build') {
     console.warn('Continuing despite migration error during build phase');
   } else {
     throw error;
@@ -299,7 +419,7 @@ try {
 function runBetterAuthDataMigration() {
   if (sqlitePath === ":memory:") return;
 
-  const { settings, users, accounts } = schema;
+  const { settings, users, accounts, oauthProviders } = schema;
 
   const flag = db.select().from(settings).where(eq(settings.key, "better_auth_migrated")).get();
   if (flag) return;
@@ -314,8 +434,13 @@ function runBetterAuthDataMigration() {
       and(eq(accounts.userId, user.id), eq(accounts.providerId, user.provider), eq(accounts.accountId, user.subject))
     ).get();
     if (!existing) {
+      const configuredProvider = db.select({ issuer: oauthProviders.issuer })
+        .from(oauthProviders)
+        .where(eq(oauthProviders.id, user.provider))
+        .get();
       db.insert(accounts).values({
         userId: user.id,
+        issuer: resolveOAuthAccountIssuer(user.provider, configuredProvider?.issuer),
         accountId: user.subject,
         providerId: user.provider,
         createdAt: user.createdAt,
@@ -333,6 +458,7 @@ function runBetterAuthDataMigration() {
     if (!existing) {
       db.insert(accounts).values({
         userId: user.id,
+        issuer: CREDENTIAL_ACCOUNT_ISSUER,
         accountId: user.id.toString(),
         providerId: "credential",
         password: user.passwordHash,

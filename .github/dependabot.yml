@@ -47,6 +47,31 @@ updates:
     # Security updates always get their own PR
     versioning-strategy: increase
 
+  # Pinned Caddy, xcaddy, and plugin module updates
+  - package-ecosystem: "gomod"
+    directory: "/docker/caddy"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 10
+    reviewers:
+      - "fuomag9"
+    labels:
+      - "dependencies"
+      - "caddy"
+      - "security"
+    commit-message:
+      prefix: "caddy"
+    groups:
+      caddy-build:
+        patterns:
+          - "github.com/caddyserver/*"
+          - "github.com/caddy-dns/*"
+          - "github.com/mholt/caddy-l4"
+          - "github.com/fuomag9/caddy-blocker-plugin"
+          - "github.com/corazawaf/coraza-caddy/v2"
+          - "github.com/google/cel-go"
+
   # Docker base images updates
   - package-ecosystem: "docker"
     directory: "/docker/web"

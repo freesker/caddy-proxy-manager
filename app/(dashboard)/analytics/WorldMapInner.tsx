@@ -4,9 +4,19 @@ import { useState, useMemo, useCallback, useEffect } from 'react';
 import MapGL, { Layer, Popup, Source, type MapLayerMouseEvent } from 'react-map-gl/maplibre';
 import { feature } from 'topojson-client';
 import type { Topology, GeometryCollection } from 'topojson-specification';
-import type { ExpressionSpecification, FillLayerSpecification, LineLayerSpecification } from 'maplibre-gl';
+import { setWorkerUrl, type ExpressionSpecification, type FillLayerSpecification, type LineLayerSpecification } from 'maplibre-gl';
 import { Skeleton } from '@/components/ui/skeleton';
 import 'maplibre-gl/dist/maplibre-gl.css';
+
+// maplibre-gl v6 loads its tile worker from a separate file resolved at runtime
+// from `import.meta.url`. Under Turbopack that lookup does not survive bundling,
+// so the worker never starts and the map renders as an empty ocean. The worker
+// is staged under public/ at build time (scripts/copy-maplibre-worker.mjs) and
+// pointed at explicitly here. Requires `worker-src 'self'` in the CSP (proxy.ts) —
+// the worker is a same-origin URL now, not the blob: URL v5 used.
+if (typeof window !== 'undefined') {
+  setWorkerUrl('/maplibre/maplibre-gl-worker.mjs');
+}
 
 const A2N: Record<string, string> = {
   AF:'4',AL:'8',DZ:'12',AD:'20',AO:'24',AG:'28',AR:'32',AM:'51',

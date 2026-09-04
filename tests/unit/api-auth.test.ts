@@ -11,7 +11,8 @@ vi.mock('@/src/lib/auth', () => ({
   checkSameOrigin: vi.fn(() => null),
 }));
 
-import { authenticateApiRequest, requireApiUser, requireApiAdmin, ApiAuthError, apiErrorResponse } from '@/src/lib/api-auth';
+import { authenticateApiRequest, requireApiUser, requireApiAdmin, ApiAuthError, NotFoundError, apiErrorResponse } from '@/src/lib/api-auth';
+import { ApiClientError, ApiConflictError, ApiValidationError } from '@/src/lib/api-errors';
 import { validateToken } from '@/src/lib/models/api-tokens';
 import { auth, checkSameOrigin } from '@/src/lib/auth';
 import { NextResponse } from 'next/server';
@@ -190,11 +191,54 @@ describe('apiErrorResponse', () => {
     expect(data.error).toBe('Forbidden');
   });
 
+  it('maps only an explicit NotFoundError to a safe 404', async () => {
+    const response = apiErrorResponse(new NotFoundError('Token not found'));
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({ error: 'Token not found' });
+  });
+
+  it.each([
+    [new ApiValidationError('Safe validation detail'), 400],
+    [new ApiConflictError('Safe conflict detail'), 409],
+  ])('returns explicitly client-safe errors without an error ID', async (error, status) => {
+    const response = apiErrorResponse(error);
+    expect(response.status).toBe(status);
+    expect(await response.json()).toEqual({ error: error.message });
+  });
+
+  it('prevents client-safe errors from being used to expose 5xx failures', () => {
+    expect(() => new ApiClientError('must stay private', 500)).toThrow(
+      /status must be a 4xx status code/
+    );
+  });
+
   it('handles generic Error', async () => {
-    const response = apiErrorResponse(new Error('Something broke'));
+    const sensitiveMessage = 'Caddy at http://caddy:2019 failed: secret detail';
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const failure = Object.assign(new Error(sensitiveMessage), {
+      name: `Sensitive-${sensitiveMessage}`,
+      code: `SECRET-${sensitiveMessage}`,
+    });
+    const response = apiErrorResponse(failure);
     expect(response.status).toBe(500);
     const data = await response.json();
-    expect(data.error).toBe('Something broke');
+    expect(data.error).toBe('Internal server error');
+    expect(data.errorId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(JSON.stringify(data)).not.toContain(sensitiveMessage);
+    expect(JSON.stringify(consoleSpy.mock.calls)).not.toContain(sensitiveMessage);
+    consoleSpy.mockRestore();
+  });
+
+  it('does not infer a safe 404 from an untyped internal error message', async () => {
+    const response = apiErrorResponse(new Error('database table not found at /internal/path'));
+    expect(response.status).toBe(500);
+    expect(await response.json()).toMatchObject({ error: 'Internal server error' });
+  });
+
+  it('preserves legacy model 404 semantics without reflecting model details', async () => {
+    const response = apiErrorResponse(new Error('Sensitive tenant record not found'));
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({ error: 'Resource not found' });
   });
 
   it('handles unknown error', async () => {
@@ -202,5 +246,6 @@ describe('apiErrorResponse', () => {
     expect(response.status).toBe(500);
     const data = await response.json();
     expect(data.error).toBe('Internal server error');
+    expect(data.errorId).toMatch(/^[0-9a-f-]{36}$/);
   });
 });

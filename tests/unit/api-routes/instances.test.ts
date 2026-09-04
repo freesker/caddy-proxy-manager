@@ -86,7 +86,11 @@ describe('GET /api/v1/instances', () => {
 
 describe('POST /api/v1/instances', () => {
   it('creates an instance and returns 201', async () => {
-    const body = { name: 'Slave 2', url: 'https://slave2.example.com:3000', token: 'token-xyz' };
+    const body = {
+      name: 'Slave 2',
+      baseUrl: 'https://slave2.example.com:3000',
+      apiToken: 'a'.repeat(32),
+    };
     mockCreate.mockResolvedValue({ id: 2, ...body } as any);
 
     const response = await POST(createMockRequest({ method: 'POST', body }));
@@ -95,6 +99,20 @@ describe('POST /api/v1/instances', () => {
     expect(response.status).toBe(201);
     expect(data.id).toBe(2);
     expect(mockCreate).toHaveBeenCalledWith(body);
+  });
+
+  it('rejects a weak sync token before creating an instance', async () => {
+    const body = {
+      name: 'Weak slave',
+      baseUrl: 'https://weak.example.com:3000',
+      apiToken: 'short',
+    };
+
+    const response = await POST(createMockRequest({ method: 'POST', body }));
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: 'Sync token must be at least 32 characters' });
+    expect(mockCreate).not.toHaveBeenCalled();
   });
 });
 

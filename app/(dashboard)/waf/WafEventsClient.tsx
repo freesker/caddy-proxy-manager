@@ -8,6 +8,8 @@ import { Search, X, ShieldOff, Trash2, Copy, ChevronDown } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { bytesToMib, MAX_BODY_LIMIT_MIB, MIN_BODY_LIMIT_MIB } from "@/lib/caddy-waf";
+import { formatDateTimeUtc } from "@/src/lib/date-format";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -48,20 +50,25 @@ type Props = {
 
 type RangeOption = Props['initialRange'];
 
-function formatDateTimeLocal(unixTs: number | null): string {
+// UTC-based counterparts of the datetime-local input helpers below, so the
+// custom-range fields match the UTC timestamps shown in the event list and
+// render identically on the server and in the browser.
+function formatDateTimeLocalUtc(unixTs: number | null): string {
   if (!unixTs) return '';
   const d = new Date(unixTs * 1000);
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  const hh = String(d.getHours()).padStart(2, '0');
-  const min = String(d.getMinutes()).padStart(2, '0');
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  const hh = String(d.getUTCHours()).padStart(2, '0');
+  const min = String(d.getUTCMinutes()).padStart(2, '0');
   return `${yyyy}-${mm}-${dd}T${hh}:${min}`;
 }
 
-function parseDateTimeLocal(value: string): number | null {
+function parseDateTimeLocalUtc(value: string): number | null {
   if (!value) return null;
-  const ts = Math.floor(new Date(value).getTime() / 1000);
+  // "YYYY-MM-DDTHH:mm" is parsed as local time per spec; the trailing "Z"
+  // pins it to UTC so it matches the displayed timestamps.
+  const ts = Math.floor(new Date(`${value}Z`).getTime() / 1000);
   return Number.isFinite(ts) ? ts : null;
 }
 
@@ -498,8 +505,8 @@ function EventDetailPanel({
 
           {/* Metadata grid */}
           <div className="grid grid-cols-2 gap-x-4 gap-y-3 rounded-lg border bg-muted/30 p-4">
-            <DetailRow label="Time">
-              <p className="text-sm">{new Date(event.ts * 1000).toLocaleString()}</p>
+            <DetailRow label="Time (UTC)">
+              <p className="text-sm">{formatDateTimeUtc(event.ts * 1000)}</p>
             </DetailRow>
             <DetailRow label="Host">
               <p className="font-mono text-sm break-all">{event.host || "—"}</p>
@@ -737,8 +744,8 @@ export default function WafEventsClient({ events, stats, pagination, initialSear
   const [tab, setTab]                             = useState("events");
   const [searchTerm, setSearchTerm]               = useState(initialSearch);
   const [range, setRange]                         = useState<RangeOption>(initialRange);
-  const [customFrom, setCustomFrom]               = useState(formatDateTimeLocal(initialFrom));
-  const [customTo, setCustomTo]                   = useState(formatDateTimeLocal(initialTo));
+  const [customFrom, setCustomFrom]               = useState(formatDateTimeLocalUtc(initialFrom));
+  const [customTo, setCustomTo]                   = useState(formatDateTimeLocalUtc(initialTo));
   const [selected, setSelected]                   = useState<WafEvent | null>(null);
   const [localGlobalExcluded, setLocalGlobalExcluded]     = useState(globalExcluded);
   const [localGlobalMessages, setLocalGlobalMessages]     = useState(globalExcludedMessages);
@@ -747,13 +754,16 @@ export default function WafEventsClient({ events, stats, pagination, initialSear
   const [wafEnabled, setWafEnabled] = useState(globalWaf?.enabled ?? false);
   const [wafLoadOwaspCrs, setWafLoadOwaspCrs]     = useState(globalWaf?.load_owasp_crs ?? true);
   const [wafCustomDirectives, setWafCustomDirectives]     = useState(globalWaf?.custom_directives ?? "");
+  const [wafBodyLimitMb, setWafBodyLimitMb]               = useState(bytesToMib(globalWaf?.request_body_limit));
+  const [wafInMemoryLimitMb, setWafInMemoryLimitMb]       = useState(bytesToMib(globalWaf?.request_body_in_memory_limit));
+  const [wafLimitAction, setWafLimitAction]               = useState(globalWaf?.request_body_limit_action ?? "");
   const [wafShowTemplates, setWafShowTemplates]   = useState(false);
 
   useEffect(() => { setSearchTerm(initialSearch); }, [initialSearch]);
   useEffect(() => {
     setRange(initialRange);
-    setCustomFrom(formatDateTimeLocal(initialFrom));
-    setCustomTo(formatDateTimeLocal(initialTo));
+    setCustomFrom(formatDateTimeLocalUtc(initialFrom));
+    setCustomTo(formatDateTimeLocalUtc(initialTo));
   }, [initialRange, initialFrom, initialTo]);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -786,8 +796,8 @@ export default function WafEventsClient({ events, stats, pagination, initialSear
 
     params.set('range', nextRange);
     if (nextRange === 'custom') {
-      const fromTs = parseDateTimeLocal(nextFrom ?? '');
-      const toTs = parseDateTimeLocal(nextTo ?? '');
+      const fromTs = parseDateTimeLocalUtc(nextFrom ?? '');
+      const toTs = parseDateTimeLocalUtc(nextTo ?? '');
       if (fromTs == null || toTs == null || fromTs >= toTs) {
         toast.error('Choose a valid custom time range');
         return;
@@ -812,8 +822,8 @@ export default function WafEventsClient({ events, stats, pagination, initialSear
     if (!customFrom || !customTo) {
       const now = new Date();
       const dayAgo = new Date(now.getTime() - (24 * 60 * 60 * 1000));
-      setCustomFrom(formatDateTimeLocal(Math.floor(dayAgo.getTime() / 1000)));
-      setCustomTo(formatDateTimeLocal(Math.floor(now.getTime() / 1000)));
+      setCustomFrom(formatDateTimeLocalUtc(Math.floor(dayAgo.getTime() / 1000)));
+      setCustomTo(formatDateTimeLocalUtc(Math.floor(now.getTime() / 1000)));
     }
   }, [customFrom, customTo]);
 
@@ -833,7 +843,7 @@ export default function WafEventsClient({ events, stats, pagination, initialSear
             <BlockedChip blocked={event.blocked} />
             <SeverityChip severity={event.severity} />
           </div>
-          <span className="text-xs text-muted-foreground">{new Date(event.ts * 1000).toLocaleString()}</span>
+          <span className="text-xs text-muted-foreground">{formatDateTimeUtc(event.ts * 1000)}</span>
         </div>
         <p className="text-xs font-mono text-muted-foreground break-all">{event.host || "—"}</p>
         {event.ruleId && <span className="text-xs text-muted-foreground">Rule #{event.ruleId}</span>}
@@ -843,10 +853,13 @@ export default function WafEventsClient({ events, stats, pagination, initialSear
 
   const columns = [
     {
-      id: "ts", label: "Time", width: 150,
+      id: "ts", label: "Time (UTC)", width: 150,
+      // formatDateTimeUtc pins locale and timezone, so the server-rendered and
+      // client-rendered text are identical (no hydration mismatch, no locale-
+      // dependent dots vs slashes — issue #233).
       render: (r: WafEvent) => (
         <span className="text-muted-foreground text-[0.78rem] whitespace-nowrap font-mono">
-          {new Date(r.ts * 1000).toLocaleString()}
+          {formatDateTimeUtc(r.ts * 1000)}
         </span>
       ),
     },
@@ -939,8 +952,8 @@ export default function WafEventsClient({ events, stats, pagination, initialSear
                 </div>
                 {range === 'custom' && (
                   <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-                    <Input type="datetime-local" value={customFrom} onChange={(e) => setCustomFrom(e.target.value)} className="sm:w-[220px]" />
-                    <Input type="datetime-local" value={customTo} onChange={(e) => setCustomTo(e.target.value)} className="sm:w-[220px]" />
+                    <Input type="datetime-local" aria-label="From (UTC)" value={customFrom} onChange={(e) => setCustomFrom(e.target.value)} className="sm:w-[220px]" />
+                    <Input type="datetime-local" aria-label="To (UTC)" value={customTo} onChange={(e) => setCustomTo(e.target.value)} className="sm:w-[220px]" />
                     <Button size="sm" onClick={() => pushRange('custom', customFrom, customTo)}>Apply range</Button>
                   </div>
                 )}
@@ -1035,6 +1048,70 @@ export default function WafEventsClient({ events, stats, pagination, initialSear
                   className="font-mono text-[0.8rem] resize-y"
                 />
                 <p className="text-xs text-muted-foreground">ModSecurity SecLang syntax. Applied after OWASP CRS if enabled.</p>
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <Label>Request body limits</Label>
+                <p className="text-xs text-muted-foreground">
+                  Coraza buffers each request body for inspection and rejects anything larger than its
+                  limit — 12.5 MiB with the OWASP CRS loaded, which is what makes large uploads fail.
+                  Leave blank to keep that default. Coraza&apos;s hard maximum is {MAX_BODY_LIMIT_MIB} MiB.
+                </p>
+                <div className="flex flex-wrap gap-3">
+                  <div className="flex flex-col gap-1 min-w-[160px] flex-1">
+                    <Input
+                      id="waf_request_body_limit_mb"
+                      name="wafRequestBodyLimitMb"
+                      type="number"
+                      min={MIN_BODY_LIMIT_MIB}
+                      max={MAX_BODY_LIMIT_MIB}
+                      step={1}
+                      placeholder="Coraza default"
+                      value={wafBodyLimitMb}
+                      onChange={(e) => setWafBodyLimitMb(e.target.value)}
+                    />
+                    <span className="text-xs text-muted-foreground">Max body size (MiB)</span>
+                  </div>
+                  <div className="flex flex-col gap-1 min-w-[160px] flex-1">
+                    <Input
+                      id="waf_request_body_in_memory_limit_mb"
+                      name="wafRequestBodyInMemoryLimitMb"
+                      type="number"
+                      min={MIN_BODY_LIMIT_MIB}
+                      max={MAX_BODY_LIMIT_MIB}
+                      step={1}
+                      placeholder="Coraza default"
+                      value={wafInMemoryLimitMb}
+                      onChange={(e) => setWafInMemoryLimitMb(e.target.value)}
+                    />
+                    <span className="text-xs text-muted-foreground">Buffered in memory (MiB)</span>
+                  </div>
+                  <div className="flex flex-col gap-1 min-w-[160px] flex-1">
+                    <input type="hidden" name="wafRequestBodyLimitAction" value={wafLimitAction} />
+                    <div className="flex gap-2">
+                      {([
+                        { value: "", label: "Default" },
+                        { value: "Reject", label: "Reject" },
+                        { value: "ProcessPartial", label: "Partial" },
+                      ] as const).map((option) => (
+                        <div
+                          key={option.value}
+                          onClick={() => setWafLimitAction(option.value)}
+                          className={cn(
+                            "flex-1 h-9 px-2 rounded-md border cursor-pointer flex items-center justify-center select-none transition-colors",
+                            wafLimitAction === option.value
+                              ? "border-primary bg-primary/10 font-medium"
+                              : "border-input text-muted-foreground hover:border-muted-foreground"
+                          )}
+                        >
+                          <span className="text-sm">{option.label}</span>
+                        </div>
+                      ))}
+                    </div>
+                    <span className="text-xs text-muted-foreground">
+                      Over-limit action — Reject returns 413, Partial forwards the rest
+                    </span>
+                  </div>
+                </div>
               </div>
               <div>
                 <Button type="button" variant="ghost" size="sm" className="text-muted-foreground px-0" onClick={() => setWafShowTemplates((v) => !v)}>

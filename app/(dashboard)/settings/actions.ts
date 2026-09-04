@@ -3,37 +3,50 @@
 import { revalidatePath } from "next/cache";
 import { requireAdmin } from "@/src/lib/auth";
 import { applyCaddyConfig } from "@/src/lib/caddy";
+import { parseBodyLimitMib } from "@/src/lib/caddy-waf";
 import { getInstanceMode, getSlaveMasterToken, setInstanceMode, setSlaveMasterToken, syncInstances } from "@/src/lib/instance-sync";
 import { createInstance, deleteInstance, updateInstance } from "@/src/lib/models/instances";
-import { clearSetting, getSetting, saveCloudflareSettings, getDnsProviderSettings, saveDnsProviderSettings, saveGeneralSettings, saveAuthentikSettings, saveMetricsSettings, saveLoggingSettings, saveDnsSettings, saveUpstreamDnsResolutionSettings, saveGeoBlockSettings, saveWafSettings, getWafSettings } from "@/src/lib/settings";
-import { listProxyHosts, updateProxyHost } from "@/src/lib/models/proxy-hosts";
+import { clearSetting, getSetting, saveCloudflareSettings, getDnsProviderSettings, saveDnsProviderSettings, saveGeneralSettings, saveAcmeSettings, saveAuthentikSettings, saveMetricsSettings, saveLoggingSettings, saveDnsSettings, saveUpstreamDnsResolutionSettings, saveGeoBlockSettings, saveWafSettings, getWafSettings, saveErrorPagesSettings, saveTrustedProxiesSettings, saveDefaultResponseSettings, type DefaultResponseSettings } from "@/src/lib/settings";
+import { listProxyHosts, updateProxyHost, sanitizeErrorPageRules } from "@/src/lib/models/proxy-hosts";
 import { getWafRuleMessages } from "@/src/lib/models/waf-events";
 import type { CloudflareSettings, DnsProviderSettings, GeoBlockSettings, WafSettings } from "@/src/lib/settings";
 import { getProviderDefinition, encryptProviderCredentials } from "@/src/lib/dns-providers";
+import { toOAuthProviderView } from "@/src/lib/oauth-provider-view";
+import {
+  instanceSyncTokenValidationError,
+  MIN_INSTANCE_SYNC_TOKEN_LENGTH,
+} from "@/src/lib/instance-sync-token";
+import { withSettingsUpdateLock } from "@/src/lib/settings-update-lock";
 
 type ActionResult = {
   success: boolean;
   message?: string;
 };
 
-const MIN_TOKEN_LENGTH = 32;
 const VALID_UPSTREAM_DNS_FAMILIES = ["ipv6", "ipv4", "both"] as const;
+
+function serializedSettingsAction<TArgs extends unknown[], TResult>(
+  action: (...args: TArgs) => Promise<TResult>
+): (...args: TArgs) => Promise<TResult> {
+  return async (...args: TArgs) => withSettingsUpdateLock(() => action(...args));
+}
 
 /**
  * Validates that a sync token meets minimum security requirements.
  * Tokens must be at least 32 characters to provide adequate entropy.
  */
 function validateSyncToken(token: string): { valid: boolean; error?: string } {
-  if (token.length < MIN_TOKEN_LENGTH) {
+  const error = instanceSyncTokenValidationError(token);
+  if (error) {
     return {
       valid: false,
-      error: `Token must be at least ${MIN_TOKEN_LENGTH} characters for security. Consider using a randomly generated token.`
+      error: `${error}. Consider using a randomly generated ${MIN_INSTANCE_SYNC_TOKEN_LENGTH}-byte token.`
     };
   }
   return { valid: true };
 }
 
-export async function updateGeneralSettingsAction(_prevState: ActionResult | null, formData: FormData): Promise<ActionResult> {
+async function updateGeneralSettingsActionUnlocked(_prevState: ActionResult | null, formData: FormData): Promise<ActionResult> {
   try {
     await requireAdmin();
     const mode = await getInstanceMode();
@@ -57,7 +70,64 @@ export async function updateGeneralSettingsAction(_prevState: ActionResult | nul
   }
 }
 
-export async function updateCloudflareSettingsAction(_prevState: ActionResult | null, formData: FormData): Promise<ActionResult> {
+async function updateAcmeSettingsActionUnlocked(_prevState: ActionResult | null, formData: FormData): Promise<ActionResult> {
+  try {
+    await requireAdmin();
+    const mode = await getInstanceMode();
+    const overrideEnabled = formData.get("overrideEnabled") === "on";
+    if (mode === "slave" && !overrideEnabled) {
+      await clearSetting("acme");
+      try {
+        await applyCaddyConfig();
+        revalidatePath("/settings");
+        return { success: true, message: "ACME settings reset to master defaults" };
+      } catch (error) {
+        console.error("Failed to apply Caddy config:", error);
+        revalidatePath("/settings");
+        const errorMsg = error instanceof Error ? error.message : "Unknown error";
+        await syncInstances();
+        return { success: true, message: `Settings reset, but could not apply to Caddy: ${errorMsg}` };
+      }
+    }
+
+    const caUrl = formData.get("caUrl") ? String(formData.get("caUrl")).trim() : "";
+    const caRootPem = formData.get("caRootPem") ? String(formData.get("caRootPem")).trim() : "";
+
+    if (caUrl) {
+      let parsed: URL;
+      try {
+        parsed = new URL(caUrl);
+      } catch {
+        return { success: false, message: "Invalid ACME directory URL." };
+      }
+      if (parsed.protocol !== "https:") {
+        return { success: false, message: "ACME directory URL must use HTTPS." };
+      }
+    }
+
+    await saveAcmeSettings({
+      caUrl: caUrl.length > 0 ? caUrl : undefined,
+      caRootPem: caRootPem.length > 0 ? caRootPem : undefined
+    });
+
+    try {
+      await applyCaddyConfig();
+      revalidatePath("/settings");
+      return { success: true, message: "ACME settings saved successfully" };
+    } catch (error) {
+      console.error("Failed to apply Caddy config:", error);
+      revalidatePath("/settings");
+      const errorMsg = error instanceof Error ? error.message : "Unknown error";
+      await syncInstances();
+      return { success: true, message: `Settings saved, but could not apply to Caddy: ${errorMsg}` };
+    }
+  } catch (error) {
+    console.error("Failed to save ACME settings:", error);
+    return { success: false, message: error instanceof Error ? error.message : "Failed to save ACME settings" };
+  }
+}
+
+async function updateCloudflareSettingsActionUnlocked(_prevState: ActionResult | null, formData: FormData): Promise<ActionResult> {
   try {
     await requireAdmin();
     const mode = await getInstanceMode();
@@ -114,7 +184,7 @@ export async function updateCloudflareSettingsAction(_prevState: ActionResult | 
   }
 }
 
-export async function updateDnsProviderSettingsAction(_prevState: ActionResult | null, formData: FormData): Promise<ActionResult> {
+async function updateDnsProviderSettingsActionUnlocked(_prevState: ActionResult | null, formData: FormData): Promise<ActionResult> {
   try {
     await requireAdmin();
     const mode = await getInstanceMode();
@@ -230,7 +300,7 @@ export async function updateDnsProviderSettingsAction(_prevState: ActionResult |
   }
 }
 
-export async function updateAuthentikSettingsAction(_prevState: ActionResult | null, formData: FormData): Promise<ActionResult> {
+async function updateAuthentikSettingsActionUnlocked(_prevState: ActionResult | null, formData: FormData): Promise<ActionResult> {
   try {
     await requireAdmin();
     const mode = await getInstanceMode();
@@ -264,7 +334,7 @@ export async function updateAuthentikSettingsAction(_prevState: ActionResult | n
   }
 }
 
-export async function updateMetricsSettingsAction(_prevState: ActionResult | null, formData: FormData): Promise<ActionResult> {
+async function updateMetricsSettingsActionUnlocked(_prevState: ActionResult | null, formData: FormData): Promise<ActionResult> {
   try {
     await requireAdmin();
     const mode = await getInstanceMode();
@@ -316,7 +386,7 @@ export async function updateMetricsSettingsAction(_prevState: ActionResult | nul
   }
 }
 
-export async function updateLoggingSettingsAction(_prevState: ActionResult | null, formData: FormData): Promise<ActionResult> {
+async function updateLoggingSettingsActionUnlocked(_prevState: ActionResult | null, formData: FormData): Promise<ActionResult> {
   try {
     await requireAdmin();
     const mode = await getInstanceMode();
@@ -380,7 +450,58 @@ function parseResolverList(value: string | null): string[] {
     .filter((s) => s.length > 0);
 }
 
-export async function updateDnsSettingsAction(_prevState: ActionResult | null, formData: FormData): Promise<ActionResult> {
+async function updateTrustedProxiesSettingsActionUnlocked(_prevState: ActionResult | null, formData: FormData): Promise<ActionResult> {
+  try {
+    await requireAdmin();
+    const mode = await getInstanceMode();
+    const overrideEnabled = formData.get("overrideEnabled") === "on";
+    if (mode === "slave" && !overrideEnabled) {
+      await clearSetting("trusted_proxies");
+      try {
+        await applyCaddyConfig();
+        revalidatePath("/settings");
+        return { success: true, message: "Trusted proxies settings reset to master defaults" };
+      } catch (error) {
+        console.error("Failed to apply Caddy config:", error);
+        revalidatePath("/settings");
+        const errorMsg = error instanceof Error ? error.message : "Unknown error";
+        await syncInstances();
+        return { success: true, message: `Settings reset, but could not apply to Caddy: ${errorMsg}` };
+      }
+    }
+
+    const ranges = parseResolverList(formData.get("ranges") ? String(formData.get("ranges")) : null);
+    const clientIpHeaders = parseResolverList(
+      formData.get("clientIpHeaders") ? String(formData.get("clientIpHeaders")) : null
+    );
+    const strict = formData.get("strict") === "on";
+    const defaultGeoblock = formData.get("defaultGeoblock") === "on";
+
+    await saveTrustedProxiesSettings({
+      ranges,
+      client_ip_headers: clientIpHeaders.length > 0 ? clientIpHeaders : undefined,
+      strict: strict || undefined,
+      default_geoblock: defaultGeoblock || undefined,
+    });
+
+    try {
+      await applyCaddyConfig();
+      revalidatePath("/settings");
+      return { success: true, message: "Trusted proxies settings saved and applied successfully" };
+    } catch (error) {
+      console.error("Failed to apply Caddy config:", error);
+      revalidatePath("/settings");
+      const errorMsg = error instanceof Error ? error.message : "Unknown error";
+      await syncInstances();
+      return { success: true, message: `Settings saved, but could not apply to Caddy: ${errorMsg}` };
+    }
+  } catch (error) {
+    console.error("Failed to save trusted proxies settings:", error);
+    return { success: false, message: error instanceof Error ? error.message : "Failed to save trusted proxies settings" };
+  }
+}
+
+async function updateDnsSettingsActionUnlocked(_prevState: ActionResult | null, formData: FormData): Promise<ActionResult> {
   try {
     await requireAdmin();
     const mode = await getInstanceMode();
@@ -442,7 +563,7 @@ export async function updateDnsSettingsAction(_prevState: ActionResult | null, f
   }
 }
 
-export async function updateUpstreamDnsResolutionSettingsAction(
+async function updateUpstreamDnsResolutionSettingsActionUnlocked(
   _prevState: ActionResult | null,
   formData: FormData
 ): Promise<ActionResult> {
@@ -502,7 +623,7 @@ export async function updateUpstreamDnsResolutionSettingsAction(
   }
 }
 
-export async function updateInstanceModeAction(_prevState: ActionResult | null, formData: FormData): Promise<ActionResult> {
+async function updateInstanceModeActionUnlocked(_prevState: ActionResult | null, formData: FormData): Promise<ActionResult> {
   try {
     await requireAdmin();
     const mode = String(formData.get("mode") ?? "").trim() as "standalone" | "master" | "slave";
@@ -518,12 +639,11 @@ export async function updateInstanceModeAction(_prevState: ActionResult | null, 
   }
 }
 
-export async function updateSlaveMasterTokenAction(_prevState: ActionResult | null, formData: FormData): Promise<ActionResult> {
+async function updateSlaveMasterTokenActionUnlocked(_prevState: ActionResult | null, formData: FormData): Promise<ActionResult> {
   try {
     await requireAdmin();
     const clearToken = formData.get("clearToken") === "on";
     const rawToken = formData.get("masterToken") ? String(formData.get("masterToken")).trim() : "";
-    const current = await getSlaveMasterToken();
 
     // If clearing, allow empty token
     if (clearToken) {
@@ -544,6 +664,7 @@ export async function updateSlaveMasterTokenAction(_prevState: ActionResult | nu
     }
 
     // No change - keep existing token
+    const current = await getSlaveMasterToken();
     if (!current) {
       return { success: false, message: "No token provided. Please enter a sync token." };
     }
@@ -654,7 +775,7 @@ function parseGeoBlockResponseHeaders(formData: FormData): Record<string, string
   return headers;
 }
 
-export async function updateGeoBlockSettingsAction(_prevState: ActionResult | null, formData: FormData): Promise<ActionResult> {
+async function updateGeoBlockSettingsActionUnlocked(_prevState: ActionResult | null, formData: FormData): Promise<ActionResult> {
   try {
     await requireAdmin();
 
@@ -716,6 +837,119 @@ export async function updateGeoBlockSettingsAction(_prevState: ActionResult | nu
   }
 }
 
+async function updateErrorPagesSettingsActionUnlocked(_prevState: ActionResult | null, formData: FormData): Promise<ActionResult> {
+  try {
+    await requireAdmin();
+
+    const raw = formData.get("errorPagesJson");
+    let rules: ReturnType<typeof sanitizeErrorPageRules> = [];
+    if (raw && typeof raw === "string") {
+      try {
+        rules = sanitizeErrorPageRules(JSON.parse(raw));
+      } catch {
+        return { success: false, message: "Invalid error pages payload" };
+      }
+    }
+
+    await saveErrorPagesSettings({ rules });
+
+    try {
+      await applyCaddyConfig();
+      revalidatePath("/settings");
+      return { success: true, message: "Error pages saved and applied successfully" };
+    } catch (error) {
+      console.error("Failed to apply Caddy config:", error);
+      revalidatePath("/settings");
+      const errorMsg = error instanceof Error ? error.message : "Unknown error";
+      await syncInstances();
+      return { success: true, message: `Settings saved, but could not apply to Caddy: ${errorMsg}` };
+    }
+  } catch (error) {
+    console.error("Failed to save error pages settings:", error);
+    return { success: false, message: error instanceof Error ? error.message : "Failed to save error pages settings" };
+  }
+}
+
+function parseDefaultResponseHeaders(value: FormDataEntryValue | null): Record<string, string> | undefined {
+  if (typeof value !== "string" || value.trim().length === 0) return undefined;
+
+  const headers: Record<string, string> = {};
+  for (const rawLine of value.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const separator = line.indexOf(":");
+    if (separator <= 0) {
+      throw new Error(`Invalid response header line: ${rawLine}`);
+    }
+    headers[line.slice(0, separator).trim()] = line.slice(separator + 1).trim();
+  }
+  return Object.keys(headers).length > 0 ? headers : undefined;
+}
+
+async function updateDefaultResponseSettingsActionUnlocked(
+  _prevState: ActionResult | null,
+  formData: FormData
+): Promise<ActionResult> {
+  try {
+    await requireAdmin();
+    const mode = await getInstanceMode();
+    const overrideEnabled = formData.get("overrideEnabled") === "on";
+    if (mode === "slave" && !overrideEnabled) {
+      await clearSetting("default_response");
+      try {
+        await applyCaddyConfig();
+        revalidatePath("/settings");
+        return { success: true, message: "Default response reset to master settings" };
+      } catch (error) {
+        console.error("Failed to apply Caddy config:", error);
+        revalidatePath("/settings");
+        const errorMsg = error instanceof Error ? error.message : "Unknown error";
+        await syncInstances();
+        return { success: true, message: `Settings reset, but could not apply to Caddy: ${errorMsg}` };
+      }
+    }
+
+    const responseMode = String(formData.get("mode") ?? "caddy");
+    let next: DefaultResponseSettings;
+    if (responseMode === "caddy" || responseMode === "abort") {
+      next = { mode: responseMode };
+    } else if (responseMode === "respond") {
+      next = {
+        mode: "respond",
+        status: Number(formData.get("status") ?? 404),
+        body: String(formData.get("body") ?? ""),
+        headers: parseDefaultResponseHeaders(formData.get("headers")),
+      };
+    } else if (responseMode === "redirect") {
+      next = {
+        mode: "redirect",
+        status: Number(formData.get("status") ?? 302),
+        redirectUrl: String(formData.get("redirectUrl") ?? ""),
+        headers: parseDefaultResponseHeaders(formData.get("headers")),
+      };
+    } else {
+      return { success: false, message: "Invalid default response mode" };
+    }
+
+    await saveDefaultResponseSettings(next);
+
+    try {
+      await applyCaddyConfig();
+      revalidatePath("/settings");
+      return { success: true, message: "Default response saved and applied successfully" };
+    } catch (error) {
+      console.error("Failed to apply Caddy config:", error);
+      revalidatePath("/settings");
+      const errorMsg = error instanceof Error ? error.message : "Unknown error";
+      await syncInstances();
+      return { success: true, message: `Settings saved, but could not apply to Caddy: ${errorMsg}` };
+    }
+  } catch (error) {
+    console.error("Failed to save default response settings:", error);
+    return { success: false, message: error instanceof Error ? error.message : "Failed to save default response settings" };
+  }
+}
+
 export async function syncSlaveInstancesAction(_prevState: ActionResult | null, _formData: FormData): Promise<ActionResult> {
   void _prevState;
   void _formData;
@@ -755,7 +989,7 @@ export async function lookupWafRuleMessageAction(ruleId: number): Promise<{ mess
   return { message: map[ruleId] ?? null };
 }
 
-export async function removeWafRuleGloballyAction(ruleId: number): Promise<ActionResult> {
+async function removeWafRuleGloballyActionUnlocked(ruleId: number): Promise<ActionResult> {
   try {
     await requireAdmin();
     const current = await getWafSettings();
@@ -771,7 +1005,7 @@ export async function removeWafRuleGloballyAction(ruleId: number): Promise<Actio
   }
 }
 
-export async function suppressWafRuleGloballyAction(ruleId: number): Promise<ActionResult> {
+async function suppressWafRuleGloballyActionUnlocked(ruleId: number): Promise<ActionResult> {
   try {
     await requireAdmin();
     const current = await getWafSettings();
@@ -793,20 +1027,10 @@ export async function suppressWafRuleGloballyAction(ruleId: number): Promise<Act
   }
 }
 
-function redactProviderSecrets<T extends { clientId: string; clientSecret: string }>(provider: T): T {
-  const clientId = provider.clientId;
-  return {
-    ...provider,
-    clientId: clientId.length > 4 ? "••••" + clientId.slice(-4) : "••••",
-    clientSecret: "••••••••",
-  };
-}
-
 export async function getOAuthProvidersAction() {
   await requireAdmin();
   const { listOAuthProviders } = await import("@/src/lib/models/oauth-providers");
-  const providers = await listOAuthProviders();
-  return providers.map(redactProviderSecrets);
+  return listOAuthProviders();
 }
 
 export async function createOAuthProviderAction(data: {
@@ -837,7 +1061,7 @@ export async function createOAuthProviderAction(data: {
     data: JSON.stringify({ providerId: provider.id }),
   });
   revalidatePath("/settings");
-  return redactProviderSecrets(provider);
+  return toOAuthProviderView(provider);
 }
 
 export async function updateOAuthProviderAction(
@@ -872,7 +1096,7 @@ export async function updateOAuthProviderAction(
     data: JSON.stringify({ providerId: id, fields: Object.keys(data) }),
   });
   revalidatePath("/settings");
-  return updated ? redactProviderSecrets(updated) : null;
+  return updated ? toOAuthProviderView(updated) : null;
 }
 
 export async function deleteOAuthProviderAction(id: string) {
@@ -961,7 +1185,7 @@ export async function suppressWafRuleForHostAction(ruleId: number, hostname: str
   }
 }
 
-export async function updateWafSettingsAction(_prevState: ActionResult | null, formData: FormData): Promise<ActionResult> {
+async function updateWafSettingsActionUnlocked(_prevState: ActionResult | null, formData: FormData): Promise<ActionResult> {
   try {
     await requireAdmin();
 
@@ -981,7 +1205,29 @@ export async function updateWafSettingsAction(_prevState: ActionResult | null, f
       excluded_rule_ids = existing?.excluded_rule_ids ?? [];
     }
 
-    const config: WafSettings = { enabled, mode, load_owasp_crs: loadOwasp, custom_directives: customDirectives, excluded_rule_ids };
+    const requestBodyLimit = parseBodyLimitMib(formData.get("wafRequestBodyLimitMb"), "Request body limit");
+    const requestBodyInMemoryLimit = parseBodyLimitMib(formData.get("wafRequestBodyInMemoryLimitMb"), "In-memory body limit");
+    const rawAction = formData.get("wafRequestBodyLimitAction");
+    const requestBodyLimitAction =
+      rawAction === "Reject" || rawAction === "ProcessPartial" ? rawAction : undefined;
+    if (
+      requestBodyLimit !== undefined &&
+      requestBodyInMemoryLimit !== undefined &&
+      requestBodyInMemoryLimit > requestBodyLimit
+    ) {
+      return { success: false, message: "In-memory body limit must not exceed the request body limit." };
+    }
+
+    const config: WafSettings = {
+      enabled,
+      mode,
+      load_owasp_crs: loadOwasp,
+      custom_directives: customDirectives,
+      excluded_rule_ids,
+      ...(requestBodyLimit !== undefined ? { request_body_limit: requestBodyLimit } : {}),
+      ...(requestBodyInMemoryLimit !== undefined ? { request_body_in_memory_limit: requestBodyInMemoryLimit } : {}),
+      ...(requestBodyLimitAction ? { request_body_limit_action: requestBodyLimitAction } : {}),
+    };
     await saveWafSettings(config);
 
     try {
@@ -999,3 +1245,22 @@ export async function updateWafSettingsAction(_prevState: ActionResult | null, f
     return { success: false, message: error instanceof Error ? error.message : "Failed to save WAF settings" };
   }
 }
+
+export const updateGeneralSettingsAction = serializedSettingsAction(updateGeneralSettingsActionUnlocked);
+export const updateAcmeSettingsAction = serializedSettingsAction(updateAcmeSettingsActionUnlocked);
+export const updateCloudflareSettingsAction = serializedSettingsAction(updateCloudflareSettingsActionUnlocked);
+export const updateDnsProviderSettingsAction = serializedSettingsAction(updateDnsProviderSettingsActionUnlocked);
+export const updateAuthentikSettingsAction = serializedSettingsAction(updateAuthentikSettingsActionUnlocked);
+export const updateMetricsSettingsAction = serializedSettingsAction(updateMetricsSettingsActionUnlocked);
+export const updateLoggingSettingsAction = serializedSettingsAction(updateLoggingSettingsActionUnlocked);
+export const updateTrustedProxiesSettingsAction = serializedSettingsAction(updateTrustedProxiesSettingsActionUnlocked);
+export const updateDnsSettingsAction = serializedSettingsAction(updateDnsSettingsActionUnlocked);
+export const updateUpstreamDnsResolutionSettingsAction = serializedSettingsAction(updateUpstreamDnsResolutionSettingsActionUnlocked);
+export const updateInstanceModeAction = serializedSettingsAction(updateInstanceModeActionUnlocked);
+export const updateSlaveMasterTokenAction = serializedSettingsAction(updateSlaveMasterTokenActionUnlocked);
+export const updateGeoBlockSettingsAction = serializedSettingsAction(updateGeoBlockSettingsActionUnlocked);
+export const updateErrorPagesSettingsAction = serializedSettingsAction(updateErrorPagesSettingsActionUnlocked);
+export const updateDefaultResponseSettingsAction = serializedSettingsAction(updateDefaultResponseSettingsActionUnlocked);
+export const removeWafRuleGloballyAction = serializedSettingsAction(removeWafRuleGloballyActionUnlocked);
+export const suppressWafRuleGloballyAction = serializedSettingsAction(suppressWafRuleGloballyActionUnlocked);
+export const updateWafSettingsAction = serializedSettingsAction(updateWafSettingsActionUnlocked);

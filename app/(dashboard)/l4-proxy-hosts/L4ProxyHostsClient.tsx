@@ -51,6 +51,8 @@ export default function L4ProxyHostsClient({ hosts, pagination, initialSearch, i
   const [duplicateHost, setDuplicateHost] = useState<L4ProxyHost | null>(null);
   const [editHost, setEditHost] = useState<L4ProxyHost | null>(null);
   const [deleteHost, setDeleteHost] = useState<L4ProxyHost | null>(null);
+  // Counter forces CreateL4HostDialog to remount on each open, resetting useFormState
+  const [dialogKey, setDialogKey] = useState(0);
   const [searchTerm, setSearchTerm] = useState(initialSearch);
   const [bannerRefresh, setBannerRefresh] = useState(0);
 
@@ -77,6 +79,7 @@ export default function L4ProxyHostsClient({ hosts, pagination, initialSearch, i
   const handleToggleEnabled = async (id: number, enabled: boolean) => {
     await toggleL4ProxyHostAction(id, enabled);
     signalBannerRefresh();
+    router.refresh();
   };
 
   const columns = [
@@ -162,7 +165,7 @@ export default function L4ProxyHostsClient({ hosts, pagination, initialSearch, i
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
               <DropdownMenuItem onClick={() => setEditHost(host)}>Edit</DropdownMenuItem>
-              <DropdownMenuItem onClick={() => { setDuplicateHost(host); setCreateOpen(true); }}>Duplicate</DropdownMenuItem>
+              <DropdownMenuItem onClick={() => { setDuplicateHost(host); setDialogKey(k => k + 1); setCreateOpen(true); }}>Duplicate</DropdownMenuItem>
               <DropdownMenuSeparator />
               <DropdownMenuItem
                 className="text-destructive focus:text-destructive"
@@ -210,7 +213,7 @@ export default function L4ProxyHostsClient({ hosts, pagination, initialSearch, i
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
                 <DropdownMenuItem onClick={() => setEditHost(host)}>Edit</DropdownMenuItem>
-                <DropdownMenuItem onClick={() => { setDuplicateHost(host); setCreateOpen(true); }}>Duplicate</DropdownMenuItem>
+                <DropdownMenuItem onClick={() => { setDuplicateHost(host); setDialogKey(k => k + 1); setCreateOpen(true); }}>Duplicate</DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem className="text-destructive focus:text-destructive" onClick={() => setDeleteHost(host)}>Delete</DropdownMenuItem>
               </DropdownMenuContent>
@@ -228,7 +231,7 @@ export default function L4ProxyHostsClient({ hosts, pagination, initialSearch, i
       <PageHeader
         title="L4 Proxy Hosts"
         description="Define TCP/UDP stream proxies powered by caddy-l4. Port mappings are applied automatically."
-        action={{ label: "Create L4 Host", onClick: () => setCreateOpen(true) }}
+        action={{ label: "Create L4 Host", onClick: () => { setDialogKey(k => k + 1); setCreateOpen(true); } }}
       />
 
       <div className="flex items-center gap-2">
@@ -251,8 +254,9 @@ export default function L4ProxyHostsClient({ hosts, pagination, initialSearch, i
       />
 
       <CreateL4HostDialog
+        key={dialogKey}
         open={createOpen}
-        onClose={() => { setCreateOpen(false); setTimeout(() => setDuplicateHost(null), 200); signalBannerRefresh(); }}
+        onClose={() => { setCreateOpen(false); setTimeout(() => setDuplicateHost(null), 200); signalBannerRefresh(); router.refresh(); }}
         initialData={duplicateHost}
       />
 
@@ -260,7 +264,7 @@ export default function L4ProxyHostsClient({ hosts, pagination, initialSearch, i
         <EditL4HostDialog
           open={!!editHost}
           host={editHost}
-          onClose={() => { setEditHost(null); signalBannerRefresh(); }}
+          onClose={() => { setEditHost(null); signalBannerRefresh(); router.refresh(); }}
         />
       )}
 
@@ -268,7 +272,7 @@ export default function L4ProxyHostsClient({ hosts, pagination, initialSearch, i
         <DeleteL4HostDialog
           open={!!deleteHost}
           host={deleteHost}
-          onClose={() => { setDeleteHost(null); signalBannerRefresh(); }}
+          onClose={() => { setDeleteHost(null); signalBannerRefresh(); router.refresh(); }}
         />
       )}
     </div>

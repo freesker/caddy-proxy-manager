@@ -15,6 +15,7 @@ import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Separator } from "@/components/ui/separator";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
+import { formatAppVersion } from "@/src/lib/app-version";
 
 type User = {
   id: string;
@@ -70,7 +71,12 @@ function NavContent({ pathname, user, onNavigate }: {
         <div className="h-7 w-7 rounded-md bg-primary flex items-center justify-center shrink-0">
           <span className="text-primary-foreground font-bold text-xs">C</span>
         </div>
-        <p className="font-semibold text-sm tracking-tight">Caddy Proxy Manager</p>
+        <div className="flex flex-col leading-tight min-w-0">
+          <p className="font-semibold text-sm tracking-tight">Caddy Proxy Manager</p>
+          <span className="text-[11px] text-muted-foreground" title="Application version">
+            {formatAppVersion()}
+          </span>
+        </div>
       </div>
       <Separator />
 

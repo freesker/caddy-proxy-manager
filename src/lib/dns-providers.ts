@@ -39,6 +39,22 @@ export type DnsProviderCredentials = {
   credentials: Record<string, string>;
 };
 
+/**
+ * Safe representation returned by the REST settings endpoint. Credential
+ * names are useful for showing which optional fields are configured, but the
+ * values themselves must remain write-only.
+ */
+export type DnsProviderApiStatus = {
+  providers: Record<string, { configuredFields: string[] }>;
+  default: string | null;
+};
+
+export type LegacyCloudflareApiStatus = {
+  hasApiToken: boolean;
+  zoneId?: string;
+  accountId?: string;
+};
+
 // ─── Registry ────────────────────────────────────────────────────────────────
 
 export const DNS_PROVIDERS: DnsProviderDefinition[] = [
@@ -201,6 +217,56 @@ export const DNS_PROVIDERS: DnsProviderDefinition[] = [
     ],
   },
   {
+    name: "spaceship",
+    displayName: "Spaceship",
+    description: "Spaceship DNS API",
+    docsUrl: "https://github.com/caddy-dns/spaceship",
+    modulePath: "github.com/caddy-dns/spaceship",
+    fields: [
+      { key: "api_key", label: "API Key", type: "password", required: true },
+      { key: "api_secret", label: "API Secret", type: "password", required: true },
+    ],
+  },
+  {
+    name: "desec",
+    displayName: "deSEC",
+    description: "deSEC DNS API",
+    docsUrl: "https://github.com/caddy-dns/desec",
+    modulePath: "github.com/caddy-dns/desec",
+    fields: [
+      { key: "token", label: "API Token", type: "password", required: true },
+    ],
+  },
+  {
+    name: "dynu",
+    displayName: "Dynu",
+    description: "Dynu DNS API",
+    docsUrl: "https://github.com/caddy-dns/dynu",
+    modulePath: "github.com/caddy-dns/dynu",
+    fields: [
+      { key: "api_token", label: "API Token", type: "password", required: true },
+    ],
+  },
+  {
+    name: "acmedns",
+    displayName: "acme-dns",
+    description: "acme-dns delegated DNS-01 validation (dedicated ACME challenge records only)",
+    docsUrl: "https://github.com/caddy-dns/acmedns",
+    modulePath: "github.com/caddy-dns/acmedns",
+    fields: [
+      { key: "username", label: "Username", type: "string", required: true },
+      { key: "password", label: "Password", type: "password", required: true },
+      { key: "subdomain", label: "Subdomain", type: "string", required: true },
+      {
+        key: "server_url",
+        label: "Server URL",
+        type: "string",
+        required: true,
+        placeholder: "https://auth.acme-dns.io",
+      },
+    ],
+  },
+  {
     name: "infomaniak",
     displayName: "Infomaniak",
     description: "Infomaniak DNS API",
@@ -210,12 +276,94 @@ export const DNS_PROVIDERS: DnsProviderDefinition[] = [
       { key: "api_token", label: "API Token", type: "password", required: true },
     ],
   },
+  {
+    name: "netcup",
+    displayName: "netcup",
+    description: "netcup CCP DNS API",
+    docsUrl: "https://github.com/caddy-dns/netcup",
+    modulePath: "github.com/caddy-dns/netcup",
+    fields: [
+      { key: "customer_number", label: "Customer Number", type: "string", required: true },
+      { key: "api_key", label: "API Key", type: "password", required: true },
+      { key: "api_password", label: "API Password", type: "password", required: true },
+    ],
+  },
+  {
+    name: "cloudns",
+    displayName: "ClouDNS",
+    description: "ClouDNS DNS API",
+    docsUrl: "https://github.com/caddy-dns/cloudns",
+    modulePath: "github.com/caddy-dns/cloudns",
+    fields: [
+      {
+        key: "auth_id",
+        label: "Auth ID",
+        type: "string",
+        required: false,
+        placeholder: "1234",
+        description: "API user ID (created under API & Resellers). Required unless a sub-user ID is provided.",
+      },
+      {
+        key: "sub_auth_id",
+        label: "Sub-user ID",
+        type: "string",
+        required: false,
+        description: "API sub-user ID. Required unless an API user ID is provided.",
+      },
+      {
+        key: "auth_password",
+        label: "API Password",
+        type: "password",
+        required: true,
+        description: "Password of the API user or sub-user.",
+      },
+    ],
+  },
 ];
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 export function getProviderDefinition(name: string): DnsProviderDefinition | undefined {
   return DNS_PROVIDERS.find((p) => p.name === name);
+}
+
+/**
+ * Reduce DNS-provider settings to non-secret metadata before crossing an API
+ * response boundary. This intentionally redacts every value, including fields
+ * whose registry type is not `password`, so newly-added credential fields are
+ * safe by default.
+ */
+export function redactDnsProviderSettingsForApi(settings: {
+  providers: Record<string, Record<string, string>>;
+  default: string | null;
+}): DnsProviderApiStatus {
+  return {
+    providers: Object.fromEntries(
+      Object.entries(settings.providers).map(([provider, credentials]) => [
+        provider,
+        {
+          configuredFields: Object.entries(credentials)
+            .filter(([, value]) => typeof value === "string" && value.length > 0)
+            .map(([key]) => key)
+            .sort(),
+        },
+      ])
+    ),
+    default: settings.default,
+  };
+}
+
+/** Redact the credential from the legacy single-provider settings group. */
+export function redactLegacyCloudflareSettingsForApi(settings: {
+  apiToken: string;
+  zoneId?: string;
+  accountId?: string;
+}): LegacyCloudflareApiStatus {
+  return {
+    hasApiToken: settings.apiToken.length > 0,
+    ...(settings.zoneId ? { zoneId: settings.zoneId } : {}),
+    ...(settings.accountId ? { accountId: settings.accountId } : {}),
+  };
 }
 
 /**

@@ -1,41 +1,26 @@
-# syntax=docker/dockerfile:1.6
+# syntax=docker/dockerfile:1.6@sha256:ac85f380a63b13dfcefa89046420e1781752bab202122f8f50032edf31be0021
 
 # Always run the builder on the host arch (BUILDPLATFORM) and let xcaddy
 # cross-compile Caddy for the target arch via GOOS/GOARCH. This avoids QEMU
 # emulation when producing the linux/arm64 image on an x86 GitHub runner —
 # native cross-compilation is several times faster.
-FROM --platform=$BUILDPLATFORM golang:1.26 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27@sha256:4013ae0f9e7994f8535c58c811f8f863fbed38b72e0d51e6592156f758d66146 AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
 
-# Install xcaddy
-RUN go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+WORKDIR /build
+COPY docker/caddy/go.mod docker/caddy/go.sum docker/caddy/build.sh docker/caddy/update-compatibility-pins.sh ./
 
-# Build Caddy with plugins.
-# Track Caddy master until the v2.11.3 client TLS regression fix
-# (caddyserver/caddy#7724) is available in a stable release.
-RUN GOOS=$TARGETOS GOARCH=$TARGETARCH xcaddy build master \
-    --with github.com/caddy-dns/cloudflare \
-    --with github.com/caddy-dns/route53 \
-    --with github.com/caddy-dns/digitalocean \
-    --with github.com/caddy-dns/duckdns \
-    --with github.com/caddy-dns/hetzner \
-    --with github.com/caddy-dns/vultr \
-    --with github.com/caddy-dns/porkbun \
-    --with github.com/caddy-dns/godaddy \
-    --with github.com/caddy-dns/namecheap \
-    --with github.com/caddy-dns/ovh \
-    --with github.com/caddy-dns/ionos \
-    --with github.com/caddy-dns/linode \
-    --with github.com/caddy-dns/njalla \
-    --with github.com/caddy-dns/infomaniak \
-    --with github.com/mholt/caddy-l4 \
-    --with github.com/fuomag9/caddy-blocker-plugin \
-    --with github.com/corazawaf/coraza-caddy/v2 \
-    --output /usr/bin/caddy
+# Every module version comes from go.mod. Dependabot updates that file weekly;
+# the compatibility updater derives cel-go from the pinned Caddy release, and
+# go.sum authenticates the module metadata used to resolve the build.
+RUN sh ./update-compatibility-pins.sh
+RUN XCADDY_VERSION="$(go list -m -f '{{.Version}}' github.com/caddyserver/xcaddy)" && \
+    go install github.com/caddyserver/xcaddy/cmd/xcaddy@"${XCADDY_VERSION}"
+RUN sh ./build.sh
 
-FROM ubuntu:26.04
+FROM ubuntu:26.04@sha256:2260313b31c8c011cd2eebe728008efac1b3982be73eb71348ea2648d2c0e09b
 
 # Accept build args for user/group IDs to support rootless operation
 # Using 10000 as default to avoid conflicts with system users
@@ -57,8 +42,9 @@ RUN (getent group ${PGID} && groupdel $(getent group ${PGID} | cut -d: -f1) || t
     (getent passwd ${PUID} && userdel $(getent passwd ${PUID} | cut -d: -f1) || true) && \
     groupadd -g ${PGID} caddy && \
     useradd -r -u ${PUID} -g caddy -m -d /home/caddy caddy && \
-    mkdir -p /data /config /logs && \
-    chown -R caddy:caddy /data /config /logs /home/caddy
+    mkdir -p /data /config /logs /acme-ca && \
+    chown -R caddy:caddy /data /config /logs /home/caddy && \
+    chmod 0777 /acme-ca
 
 COPY --chown=caddy:caddy docker/caddy/Caddyfile /etc/caddy/Caddyfile
 

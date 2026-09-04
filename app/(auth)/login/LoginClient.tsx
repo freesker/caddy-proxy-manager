@@ -10,6 +10,7 @@ import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Separator } from "@/components/ui/separator";
+import { formatAppVersion } from "@/src/lib/app-version";
 
 interface LoginClientProps {
   enabledProviders: Array<{ id: string; name: string }>;
@@ -36,10 +37,14 @@ export default function LoginClient({ enabledProviders = [] }: LoginClientProps)
       return;
     }
 
-    const { error } = await authClient.signIn.username({
-      username,
-      password,
-    });
+    // `signIn.username` is added at runtime by the usernameClient plugin. The plugin's
+    // $InferServerPlugin types fail to merge into the client signature in some environments,
+    // so we cast a stable shape here.
+    type SignInUsername = (input: { username: string; password: string }) => Promise<{
+      error: { status?: number; message?: string } | null;
+    }>;
+    const signInUsername = (authClient.signIn as unknown as { username: SignInUsername }).username;
+    const { error } = await signInUsername({ username, password });
 
     if (error) {
       let message: string | null = null;
@@ -154,6 +159,10 @@ export default function LoginClient({ enabledProviders = [] }: LoginClientProps)
               )}
             </Button>
           </form>
+
+          <p className="text-center text-xs text-muted-foreground" title="Application version">
+            {formatAppVersion()}
+          </p>
         </CardContent>
       </Card>
     </div>

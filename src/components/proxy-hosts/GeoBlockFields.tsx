@@ -612,6 +612,17 @@ export function GeoBlockFields({ initialValues, showModeSelector = true }: GeoBl
   const [resetKey, setResetKey] = useState(0);
   const [initial, setInitial] = useState<GeoBlockSettings | null>(rawInitial);
 
+  // Re-seed the form when fresh server props arrive after a successful save
+  // (revalidatePath re-renders this component with new initialValues; useState
+  // seeds alone would keep showing the pre-save values). rawInitial is the
+  // identity we track — initialValues changes with it.
+  useEffect(() => {
+    setEnabled(rawInitial?.enabled ?? false);
+    setMode(initialValues?.geoblock_mode ?? "merge");
+    setInitial(rawInitial);
+    setResetKey((k) => k + 1);
+  }, [rawInitial]);
+
   function applyLanOnlyPreset() {
     setEnabled(true);
     setInitial((prev) => ({

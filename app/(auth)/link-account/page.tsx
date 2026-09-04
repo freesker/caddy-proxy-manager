@@ -4,9 +4,9 @@ import { peekLinkingToken, verifyLinkingToken } from "@/src/lib/services/account
 import LinkAccountClient from "./LinkAccountClient";
 
 interface LinkAccountPageProps {
-  searchParams: {
+  searchParams: Promise<{
     error?: string;
-  };
+  }>;
 }
 
 export default async function LinkAccountPage({ searchParams }: LinkAccountPageProps) {
@@ -18,7 +18,7 @@ export default async function LinkAccountPage({ searchParams }: LinkAccountPageP
   }
 
   // Get linking ID from error parameter (NextAuth redirects with error param)
-  const errorParam = searchParams.error || "";
+  const errorParam = (await searchParams).error || "";
 
   if (!errorParam.startsWith("LINKING_REQUIRED:")) {
     redirect("/login?error=Invalid linking request");

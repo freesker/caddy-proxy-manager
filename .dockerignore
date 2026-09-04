@@ -13,11 +13,7 @@ dist
 build
 
 # Environment files
-.env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
+.env*
 
 # Testing
 coverage
@@ -25,6 +21,10 @@ coverage
 # Misc
 .DS_Store
 *.pem
+*.key
+*.p12
+*.pfx
+*.jks
 
 # Debug
 *.log
@@ -49,3 +49,9 @@ caddy-config/
 # Docker files
 docker-compose.yml
 docker-compose.*.yml
+
+# The maplibre worker is staged from the container's own node_modules by
+# scripts/copy-maplibre-worker.mjs during the build. A stale copy staged on the
+# host by next dev/build (potentially from a different maplibre-gl version) must
+# not leak into the image via COPY . .
+public/maplibre

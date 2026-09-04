@@ -7,6 +7,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { DataTable } from "@/components/ui/DataTable";
 import { SearchField } from "@/components/ui/SearchField";
 import { PageHeader } from "@/components/ui/PageHeader";
+import { formatDateTimeUtc } from "@/src/lib/date-format";
 
 type EventRow = {
   id: number;
@@ -57,11 +58,11 @@ export default function AuditLogClient({ events, pagination, initialSearch }: Pr
   const columns = [
     {
       id: "created_at",
-      label: "Time",
+      label: "Time (UTC)",
       width: 180,
       render: (r: EventRow) => (
         <span className="text-sm text-muted-foreground whitespace-nowrap">
-          {new Date(r.createdAt).toLocaleString()}
+          {formatDateTimeUtc(r.createdAt)}
         </span>
       ),
     },
@@ -88,7 +89,7 @@ export default function AuditLogClient({ events, pagination, initialSearch }: Pr
         <div className="flex justify-between items-center">
           <Badge variant="outline">{r.user}</Badge>
           <span className="text-xs text-muted-foreground">
-            {new Date(r.createdAt).toLocaleString()}
+            {formatDateTimeUtc(r.createdAt)}
           </span>
         </div>
         <p className="text-sm">{r.summary}</p>

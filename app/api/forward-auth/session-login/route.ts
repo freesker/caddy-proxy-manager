@@ -4,7 +4,7 @@ import { config } from "@/src/lib/config";
 import {
   createForwardAuthSession,
   createExchangeCode,
-  checkHostAccessByDomain,
+  checkHostAccess,
   consumeRedirectIntent
 } from "@/src/lib/models/forward-auth";
 import { logAuditEvent } from "@/src/lib/audit";
@@ -36,16 +36,16 @@ export async function POST(request: NextRequest) {
     }
 
     // Consume the redirect intent — returns the server-stored redirect URI
-    const redirectUri = await consumeRedirectIntent(rid);
-    if (!redirectUri) {
+    const intent = await consumeRedirectIntent(rid);
+    if (!intent) {
       return NextResponse.json({ error: "Invalid or expired redirect intent. Please try again." }, { status: 400 });
     }
 
-    const targetUrl = new URL(redirectUri);
+    const targetUrl = new URL(intent.redirectUri);
     const userId = Number(session.user.id);
 
-    // Check if user has access to the target host
-    const { hasAccess } = await checkHostAccessByDomain(userId, targetUrl.hostname);
+    // Authorize the concrete proxy host captured by the one-time intent.
+    const hasAccess = await checkHostAccess(userId, intent.audience.proxyHostId);
     if (!hasAccess) {
       logAuditEvent({
         userId,
@@ -60,8 +60,12 @@ export async function POST(request: NextRequest) {
     }
 
     // Create forward auth session and exchange code
-    const { session: faSession } = await createForwardAuthSession(userId);
-    const { rawCode } = await createExchangeCode(faSession.id, redirectUri);
+    const { session: faSession } = await createForwardAuthSession(userId, intent.audience);
+    const { rawCode } = await createExchangeCode(
+      faSession.id,
+      intent.redirectUri,
+      intent.audience,
+    );
 
     logAuditEvent({
       userId,
@@ -71,7 +75,7 @@ export async function POST(request: NextRequest) {
       summary: `Forward auth login (session) for user ${session.user.email} to ${targetUrl.hostname}`
     });
 
-    const callbackUrl = new URL("/.cpm-auth/callback", targetUrl.origin);
+    const callbackUrl = new URL("/.cpm-auth/callback", intent.audience.origin);
     callbackUrl.searchParams.set("code", rawCode);
 
     return NextResponse.json({ redirectTo: callbackUrl.toString() });

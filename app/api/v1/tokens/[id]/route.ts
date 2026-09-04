@@ -7,9 +7,9 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const { userId } = await requireApiUser(request);
+    const { userId, role } = await requireApiUser(request);
     const { id } = await params;
-    await deleteApiToken(Number(id), userId);
+    await deleteApiToken(Number(id), userId, role === "admin");
     return NextResponse.json({ ok: true });
   } catch (error) {
     return apiErrorResponse(error);

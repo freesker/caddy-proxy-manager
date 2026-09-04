@@ -53,7 +53,7 @@ function createMockRequest(options: { method?: string; body?: unknown; authoriza
 
 beforeEach(() => {
   vi.clearAllMocks();
-  mockRequireApiUser.mockResolvedValue({ userId: 1, role: 'admin', authMethod: 'bearer' });
+  mockRequireApiUser.mockResolvedValue({ userId: 1, role: 'admin', authMethod: 'session' });
 });
 
 describe('GET /api/v1/tokens', () => {
@@ -130,6 +130,34 @@ describe('POST /api/v1/tokens', () => {
     expect(mockCreateApiToken).toHaveBeenCalledWith('Expiring Token', 1, '2027-01-01');
   });
 
+  it('rejects token creation authenticated by another bearer token', async () => {
+    mockRequireApiUser.mockResolvedValue({ userId: 1, role: 'admin', authMethod: 'bearer' });
+
+    const response = await POST(createMockRequest({
+      method: 'POST',
+      body: { name: 'Persistent replacement' },
+    }));
+
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({
+      error: 'API tokens can only be created from an authenticated session',
+    });
+    expect(mockCreateApiToken).not.toHaveBeenCalled();
+  });
+
+  it('preserves token self-service for non-admin sessions', async () => {
+    mockRequireApiUser.mockResolvedValue({ userId: 5, role: 'viewer', authMethod: 'session' });
+    mockCreateApiToken.mockResolvedValue({
+      token: { id: 12, name: 'Viewer Token' },
+      rawToken: 'viewer-token',
+    } as any);
+
+    const response = await POST(createMockRequest({ method: 'POST', body: { name: 'Viewer Token' } }));
+
+    expect(response.status).toBe(201);
+    expect(mockCreateApiToken).toHaveBeenCalledWith('Viewer Token', 5, undefined);
+  });
+
   it('returns 400 when name is missing', async () => {
     const response = await POST(createMockRequest({ method: 'POST', body: {} }));
     const data = await response.json();
@@ -156,7 +184,19 @@ describe('DELETE /api/v1/tokens/[id]', () => {
 
     expect(response.status).toBe(200);
     expect(data).toEqual({ ok: true });
-    expect(mockDeleteApiToken).toHaveBeenCalledWith(5, 1);
+    expect(mockDeleteApiToken).toHaveBeenCalledWith(5, 1, true);
+  });
+
+  it('limits non-admin deletion to the authenticated user', async () => {
+    mockRequireApiUser.mockResolvedValue({ userId: 7, role: 'user', authMethod: 'session' });
+    mockDeleteApiToken.mockResolvedValue(undefined as any);
+
+    const response = await DELETE(createMockRequest({ method: 'DELETE' }), {
+      params: Promise.resolve({ id: '9' }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(mockDeleteApiToken).toHaveBeenCalledWith(9, 7, false);
   });
 
   it('returns 401 on auth failure', async () => {

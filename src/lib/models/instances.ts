@@ -2,6 +2,8 @@ import db, { nowIso, toIso } from "../db";
 import { instances } from "../db/schema";
 import { asc, eq } from "drizzle-orm";
 import { encryptSecret } from "../secret";
+import { assertValidInstanceSyncToken } from "../instance-sync-token";
+import { sanitizeInstanceSyncError } from "../instance-sync-error";
 
 export type Instance = {
   id: number;
@@ -32,7 +34,7 @@ function toInstance(row: InstanceRow): Instance {
     enabled: Boolean(row.enabled),
     hasToken: row.apiToken.length > 0,
     lastSyncAt: row.lastSyncAt ? toIso(row.lastSyncAt) : null,
-    lastSyncError: row.lastSyncError ?? null,
+    lastSyncError: sanitizeInstanceSyncError(row.lastSyncError),
     createdAt: toIso(row.createdAt)!,
     updatedAt: toIso(row.updatedAt)!
   };
@@ -52,6 +54,7 @@ export async function getInstance(id: number): Promise<InstanceRow | null> {
 }
 
 export async function createInstance(input: InstanceInput): Promise<Instance> {
+  assertValidInstanceSyncToken(input.apiToken, "Instance API token");
   const now = nowIso();
   const [row] = await db
     .insert(instances)
@@ -76,6 +79,9 @@ export async function updateInstance(
   id: number,
   input: { name?: string; baseUrl?: string; apiToken?: string; enabled?: boolean }
 ): Promise<Instance> {
+  if (input.apiToken !== undefined) {
+    assertValidInstanceSyncToken(input.apiToken, "Instance API token");
+  }
   const existing = await getInstance(id);
   if (!existing) {
     throw new Error("Instance not found");
@@ -111,7 +117,9 @@ export async function recordInstanceSyncResult(id: number, result: { ok: boolean
     .update(instances)
     .set({
       lastSyncAt: now,
-      lastSyncError: result.ok ? null : result.error ?? "Unknown sync error",
+      lastSyncError: result.ok
+        ? null
+        : sanitizeInstanceSyncError(result.error) ?? "Previous synchronization failed",
       updatedAt: now
     })
     .where(eq(instances.id, id));

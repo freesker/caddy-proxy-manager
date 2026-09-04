@@ -2,10 +2,39 @@ import { describe, expect, it } from "vitest";
 import {
   compareHostPatterns,
   groupHostPatternsByPriority,
+  hostMatchesPattern,
   sortAutomationPoliciesBySubjectPriority,
   sortRoutesByHostPriority,
   sortTlsPoliciesBySniPriority,
 } from "@/src/lib/host-pattern-priority";
+
+describe("hostMatchesPattern", () => {
+  it("matches an exact pattern only against the identical host", () => {
+    expect(hostMatchesPattern("api.example.com", "api.example.com")).toBe(true);
+    expect(hostMatchesPattern("other.example.com", "api.example.com")).toBe(false);
+  });
+
+  it("is case-insensitive", () => {
+    expect(hostMatchesPattern("API.example.com", "api.EXAMPLE.com")).toBe(true);
+  });
+
+  it("matches a wildcard against exactly one extra label", () => {
+    expect(hostMatchesPattern("radarr.example.com", "*.example.com")).toBe(true);
+    expect(hostMatchesPattern("sonarr.example.com", "*.example.com")).toBe(true);
+  });
+
+  it("does not match a wildcard against two extra labels", () => {
+    expect(hostMatchesPattern("a.b.example.com", "*.example.com")).toBe(false);
+  });
+
+  it("does not match a wildcard against the bare apex domain", () => {
+    expect(hostMatchesPattern("example.com", "*.example.com")).toBe(false);
+  });
+
+  it("does not match a wildcard against an unrelated domain", () => {
+    expect(hostMatchesPattern("evil.com", "*.example.com")).toBe(false);
+  });
+});
 
 describe("compareHostPatterns", () => {
   it("puts exact hosts ahead of same-level wildcards", () => {

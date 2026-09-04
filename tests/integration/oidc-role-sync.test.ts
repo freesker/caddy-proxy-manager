@@ -107,7 +107,7 @@ describe("syncRolesForUserSession", () => {
       realm_access: { roles: ["ops"] },
     });
     await db.insert(accounts).values({
-      userId: 10, accountId: "kc-user-1", providerId,
+      userId: 10, accountId: "kc-user-1", providerId, issuer: `local:oauth:${providerId}`,
       idToken: encryptSecret(idToken), createdAt: now, updatedAt: now,
     });
 
@@ -126,7 +126,7 @@ describe("syncRolesForUserSession", () => {
     });
     await db.insert(oauthRoleMappings).values({ providerId, role: "ops", groupId: 1, createdAt: now });
     await db.insert(accounts).values({
-      userId: 10, accountId: "10", providerId: "credential",
+      userId: 10, accountId: "10", providerId: "credential", issuer: "local:credential",
       password: "hash", createdAt: now, updatedAt: now,
     });
     const expired = makeIdToken({
@@ -134,7 +134,7 @@ describe("syncRolesForUserSession", () => {
       realm_access: { roles: ["ops"] },
     });
     await db.insert(accounts).values({
-      userId: 10, accountId: "kc-user-1", providerId,
+      userId: 10, accountId: "kc-user-1", providerId, issuer: `local:oauth:${providerId}`,
       idToken: encryptSecret(expired), createdAt: now, updatedAt: now,
     });
 

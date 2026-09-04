@@ -42,6 +42,10 @@ services:
       ADMIN_USERNAME: ${ADMIN_USERNAME:?ERROR - ADMIN_USERNAME is required}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ERROR - ADMIN_PASSWORD is required}
 
+      # Self-registration is disabled unless explicitly enabled
+      AUTH_ALLOW_SELF_REGISTRATION: ${AUTH_ALLOW_SELF_REGISTRATION:-false}
+      AUTH_ALLOW_OAUTH_REGISTRATION: ${AUTH_ALLOW_OAUTH_REGISTRATION:-false}
+
       # OAuth2/OIDC Authentication (Optional - works with Authentik, Authelia, Keycloak, etc.)
       OAUTH_ENABLED: ${OAUTH_ENABLED:-false}
       OAUTH_PROVIDER_NAME: ${OAUTH_PROVIDER_NAME:-OAuth2}
@@ -58,12 +62,18 @@ services:
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-cpm}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-analytics}
+      # Days of analytics data to keep before TTL deletes it (default 30)
+      CLICKHOUSE_RETENTION_DAYS: ${CLICKHOUSE_RETENTION_DAYS:-30}
     group_add:
-      - "${CADDY_GID:-10000}"  # caddy's GID — lets the web user read /logs/access.log
+      - "${CADDY_GID:-10000}"  # caddy's GID — lets the web user read/write /logs
     volumes:
       - caddy-manager-data:/app/data
       - geoip-data:/usr/share/GeoIP:ro,z
-      - caddy-logs:/logs:ro
+      # Read-write: waf-log-parser truncates waf-audit.log after ingesting it,
+      # since Coraza's SecAuditLog has no built-in rotation of its own.
+      - caddy-logs:/logs
+      # Custom ACME CA root PEM written here by web, read by caddy (issue #192)
+      - acme-ca:/acme-ca
     depends_on:
       caddy:
         condition: service_healthy
@@ -110,6 +120,8 @@ services:
       - caddy-config:/config
       - caddy-logs:/logs
       - geoip-data:/usr/share/GeoIP:ro,z
+      # Custom ACME CA root PEM written by web, read here for trusted_roots_pem_files (issue #192)
+      - acme-ca:/acme-ca:ro
     networks:
       - caddy-network
     healthcheck:
@@ -140,8 +152,14 @@ services:
       BUILD: 0
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+    # Security: keep the socket proxy off the shared app network. Only the
+    # l4-port-manager sidecar needs to reach its container-create API; exposing
+    # it to web/caddy/clickhouse would turn any container compromise into host
+    # root (POST + CONTAINERS = create a privileged container that mounts the
+    # host fs). This network is `internal: true` (no egress) and carries only
+    # the proxy + sidecar.
     networks:
-      - caddy-network
+      - socket-proxy
 
   # L4 Port Manager sidecar — automatically recreates the caddy container
   # when L4 proxy host ports change.
@@ -166,8 +184,11 @@ services:
         condition: service_healthy
       docker-socket-proxy:
         condition: service_started
+    # Reaches Docker only via the socket proxy (over the isolated socket-proxy
+    # network) and recreates caddy through the mounted compose dir — it does not
+    # need the shared app network.
     networks:
-      - caddy-network
+      - socket-proxy
 
   clickhouse:
     container_name: caddy-proxy-manager-clickhouse
@@ -181,7 +202,14 @@ services:
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     volumes:
       - clickhouse-data:/var/lib/clickhouse
-      - ./config.d:/etc/clickhouse-server/config.d:ro
+      # Mount only our single override files, not the whole config.d directory.
+      # Bind-mounting the directory would shadow the image's docker_related_config.xml
+      # (which sets listen_host to ::/0.0.0.0), leaving ClickHouse bound to loopback
+      # only so the web container could no longer reach it.
+      - ./docker/clickhouse/config.d/low-disk-write.xml:/etc/clickhouse-server/config.d/low-disk-write.xml:ro
+      # Server logs go to stdout/stderr (captured by Docker) instead of rotating
+      # files, which removes the "File access error" on clickhouse-server.err.log.
+      - ./docker/clickhouse/config.d/logging.xml:/etc/clickhouse-server/config.d/logging.xml:ro
     logging:
       driver: json-file
       options:
@@ -218,6 +246,12 @@ services:
 networks:
   caddy-network:
     driver: bridge
+  # Isolated network for the Docker socket proxy and the l4-port-manager sidecar
+  # only. `internal: true` prevents external connectivity; no other service is
+  # attached, so a compromise of web/caddy/etc. cannot reach the socket proxy.
+  socket-proxy:
+    driver: bridge
+    internal: true
 
 volumes:
   caddy-manager-data:
@@ -226,3 +260,4 @@ volumes:
   caddy-logs:
   geoip-data:
   clickhouse-data:
+  acme-ca:

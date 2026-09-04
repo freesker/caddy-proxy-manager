@@ -18,13 +18,20 @@ import {
   type MtlsConfig,
   type RedirectRule,
   type RewriteConfig,
-  type CpmForwardAuthInput
+  type PathAllowRule,
+  type PathBlockRule,
+  type PathRewriteRule,
+  type ErrorPageRule,
+  type CpmForwardAuthInput,
+  PATH_BLOCK_STATUS_CODES,
+  sanitizeErrorPageRules
 } from "@/src/lib/models/proxy-hosts";
 import {
   parseProxyHostsImport,
   type ImportError as ProxyHostImportError,
   type ImportFormat,
 } from "@/src/lib/proxy-hosts-import";
+import { parseBodyLimitMib } from "@/src/lib/caddy-waf";
 import { getCertificate } from "@/src/lib/models/certificates";
 import { setForwardAuthAccess } from "@/src/lib/models/forward-auth";
 import { getCloudflareSettings, type GeoBlockSettings } from "@/src/lib/settings";
@@ -362,6 +369,14 @@ function parseWafConfig(formData: FormData): { waf?: WafHostConfig | null } {
     return { waf: { enabled: false, waf_mode: wafMode } };
   }
 
+  // Blank means "inherit" — the global body limits (or Coraza's own defaults)
+  // apply. createProxyHost/updateProxyHost re-validate the resulting config.
+  const requestBodyLimit = parseBodyLimitMib(formData.get("wafRequestBodyLimitMb"), "WAF request body limit");
+  const requestBodyInMemoryLimit = parseBodyLimitMib(formData.get("wafRequestBodyInMemoryLimitMb"), "WAF in-memory body limit");
+  const rawLimitAction = formData.get("wafRequestBodyLimitAction");
+  const requestBodyLimitAction =
+    rawLimitAction === "Reject" || rawLimitAction === "ProcessPartial" ? rawLimitAction : undefined;
+
   return {
     waf: {
       enabled: true,
@@ -370,6 +385,9 @@ function parseWafConfig(formData: FormData): { waf?: WafHostConfig | null } {
       custom_directives: customDirectives,
       excluded_rule_ids,
       waf_mode: wafMode,
+      ...(requestBodyLimit !== undefined ? { request_body_limit: requestBodyLimit } : {}),
+      ...(requestBodyInMemoryLimit !== undefined ? { request_body_in_memory_limit: requestBodyInMemoryLimit } : {}),
+      ...(requestBodyLimitAction ? { request_body_limit_action: requestBodyLimitAction } : {}),
     }
   };
 }
@@ -468,7 +486,7 @@ function parseRedirectsConfig(formData: FormData): RedirectRule[] | null {
   }
 }
 
-function parseLocationRulesConfig(formData: FormData): import("@/src/lib/models/proxy-hosts").LocationRule[] | null {
+function parseLocationRulesConfig(formData: FormData): import("@/src/lib/models/proxy-hosts").LocationRuleInput[] | null {
   const raw = formData.get("locationRulesJson");
   if (!raw || typeof raw !== "string") return null;
   try {
@@ -484,6 +502,63 @@ function parseRewriteConfig(formData: FormData): RewriteConfig | null {
   const prefix = formData.get("rewritePathPrefix");
   if (!prefix || typeof prefix !== "string" || !prefix.trim()) return null;
   return { path_prefix: prefix.trim() };
+}
+
+function parsePathAllowsConfig(formData: FormData): PathAllowRule[] | null {
+  const raw = formData.get("pathAllowsJson");
+  if (!raw || typeof raw !== "string") return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    return parsed.filter(
+      (r) => r && typeof r.path === "string" && r.path.trim()
+    ) as PathAllowRule[];
+  } catch {
+    return null;
+  }
+}
+
+function parsePathBlocksConfig(formData: FormData): PathBlockRule[] | null {
+  const raw = formData.get("pathBlocksJson");
+  if (!raw || typeof raw !== "string") return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    const valid = (PATH_BLOCK_STATUS_CODES as readonly number[]);
+    return parsed.filter(
+      (r) =>
+        r &&
+        typeof r.path === "string" &&
+        typeof r.status === "number" &&
+        valid.includes(r.status)
+    ) as PathBlockRule[];
+  } catch {
+    return null;
+  }
+}
+
+function parsePathRewritesConfig(formData: FormData): PathRewriteRule[] | null {
+  const raw = formData.get("pathRewritesJson");
+  if (!raw || typeof raw !== "string") return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    return parsed.filter(
+      (r) => r && typeof r.from === "string" && typeof r.to === "string"
+    ) as PathRewriteRule[];
+  } catch {
+    return null;
+  }
+}
+
+function parseErrorPagesConfig(formData: FormData): ErrorPageRule[] | null {
+  const raw = formData.get("errorPagesJson");
+  if (!raw || typeof raw !== "string") return null;
+  try {
+    return sanitizeErrorPageRules(JSON.parse(raw));
+  } catch {
+    return null;
+  }
 }
 
 function parseUpstreamDnsResolutionConfig(formData: FormData): UpstreamDnsResolutionInput | undefined {
@@ -560,6 +635,10 @@ export async function createProxyHostAction(
         redirects: parseRedirectsConfig(formData),
         rewrite: parseRewriteConfig(formData),
         locationRules: parseLocationRulesConfig(formData),
+        pathAllows: parsePathAllowsConfig(formData),
+        pathBlocks: parsePathBlocksConfig(formData),
+        pathRewrites: parsePathRewritesConfig(formData),
+        errorPages: parseErrorPagesConfig(formData),
       },
       userId
     );
@@ -646,6 +725,10 @@ export async function updateProxyHostAction(
         redirects: formData.has("redirectsJson") ? parseRedirectsConfig(formData) : undefined,
         rewrite: formData.has("rewritePathPrefix") ? parseRewriteConfig(formData) : undefined,
         locationRules: formData.has("locationRulesJson") ? parseLocationRulesConfig(formData) : undefined,
+        pathAllows: formData.has("pathAllowsJson") ? parsePathAllowsConfig(formData) : undefined,
+        pathBlocks: formData.has("pathBlocksJson") ? parsePathBlocksConfig(formData) : undefined,
+        pathRewrites: formData.has("pathRewritesJson") ? parsePathRewritesConfig(formData) : undefined,
+        errorPages: formData.has("errorPagesJson") ? parseErrorPagesConfig(formData) : undefined,
       },
       userId
     );

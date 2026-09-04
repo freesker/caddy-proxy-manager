@@ -2,16 +2,19 @@
 
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { ChevronDown, ClipboardCopy, ShieldOff } from "lucide-react";
 import { useState } from "react";
 import { type WafHostConfig } from "@/lib/models/proxy-hosts";
+import { bytesToMib, MAX_BODY_LIMIT_MIB, MIN_BODY_LIMIT_MIB } from "@/lib/caddy-waf";
 import { WafRuleExclusions } from "./WafRuleExclusions";
 
 type WafMode = "merge" | "override";
 type EngineMode = "Off" | "On" | "inherit";
+type LimitAction = "Reject" | "ProcessPartial" | "inherit";
 
 const QUICK_TEMPLATES = [
   { label: "Allow IP", snippet: `SecRule REMOTE_ADDR "@ipMatch 1.2.3.4" "id:9000,phase:1,allow,nolog,msg:'Allow IP'"` },
@@ -34,6 +37,9 @@ export function WafFields({ value, showModeSelector = true }: Props) {
   const [loadCrs, setLoadCrs] = useState(value?.load_owasp_crs ?? true);
   const [customDirectives, setCustomDirectives] = useState(value?.custom_directives ?? "");
   const [showTemplates, setShowTemplates] = useState(false);
+  const [bodyLimitMb, setBodyLimitMb] = useState(bytesToMib(value?.request_body_limit));
+  const [inMemoryLimitMb, setInMemoryLimitMb] = useState(bytesToMib(value?.request_body_in_memory_limit));
+  const [limitAction, setLimitAction] = useState<LimitAction>(value?.request_body_limit_action ?? "inherit");
 
   return (
     <div className="rounded-lg border border-destructive bg-destructive/5 p-4">
@@ -43,6 +49,9 @@ export function WafFields({ value, showModeSelector = true }: Props) {
       <input type="hidden" name="wafEngineMode" value={engineMode} />
       <input type="hidden" name="wafLoadOwaspCrs" value={loadCrs ? "on" : ""} />
       <input type="hidden" name="wafCustomDirectives" value={customDirectives} />
+      <input type="hidden" name="wafRequestBodyLimitMb" value={bodyLimitMb} />
+      <input type="hidden" name="wafRequestBodyInMemoryLimitMb" value={inMemoryLimitMb} />
+      <input type="hidden" name="wafRequestBodyLimitAction" value={limitAction === "inherit" ? "" : limitAction} />
 
       {/* Header */}
       <div className="flex flex-row items-start justify-between gap-2">
@@ -67,7 +76,7 @@ export function WafFields({ value, showModeSelector = true }: Props) {
       {/* Expanded content */}
       <div className={cn(
         "overflow-hidden transition-all duration-200",
-        enabled ? "max-h-[2000px] opacity-100 mt-4" : "max-h-0 opacity-0 pointer-events-none"
+        enabled ? "max-h-[3000px] opacity-100 mt-4" : "max-h-0 opacity-0 pointer-events-none"
       )}>
         {/* Override mode selector */}
         {showModeSelector && (
@@ -140,6 +149,71 @@ export function WafFields({ value, showModeSelector = true }: Props) {
             </span>
           </label>
         </div>
+
+        <div className="border-t border-border mt-4 mb-3" />
+
+        {/* Request body limits */}
+        <span className="text-xs text-muted-foreground font-semibold uppercase tracking-wide">
+          Request Body Limits
+        </span>
+        <p className="text-xs text-muted-foreground mt-1">
+          Coraza buffers request bodies for inspection and rejects anything larger than its limit —
+          12.5 MiB with the OWASP CRS loaded. Raise it for hosts that receive large uploads
+          (Nextcloud, Immich, object storage). Leave blank to inherit.
+        </p>
+        <div className="flex gap-2 mt-2">
+          <div className="flex-1">
+            <Input
+              type="number"
+              min={MIN_BODY_LIMIT_MIB}
+              max={MAX_BODY_LIMIT_MIB}
+              step={1}
+              placeholder="Inherit"
+              value={bodyLimitMb}
+              onChange={(e) => setBodyLimitMb(e.target.value)}
+              className="text-sm"
+            />
+            <span className="text-xs text-muted-foreground">Max body size (MiB, up to {MAX_BODY_LIMIT_MIB})</span>
+          </div>
+          <div className="flex-1">
+            <Input
+              type="number"
+              min={MIN_BODY_LIMIT_MIB}
+              max={MAX_BODY_LIMIT_MIB}
+              step={1}
+              placeholder="Inherit"
+              value={inMemoryLimitMb}
+              onChange={(e) => setInMemoryLimitMb(e.target.value)}
+              className="text-sm"
+            />
+            <span className="text-xs text-muted-foreground">Buffered in memory (MiB)</span>
+          </div>
+        </div>
+        <div className="flex gap-2 mt-3">
+          {(["inherit", "Reject", "ProcessPartial"] as LimitAction[]).map((v) => (
+            <div
+              key={v}
+              onClick={() => setLimitAction(v)}
+              className={cn(
+                "flex-1 py-2 px-2 rounded-xl border-[1.5px] cursor-pointer text-center transition-all duration-150 select-none",
+                limitAction === v
+                  ? "border-destructive bg-destructive/10"
+                  : "border-border hover:border-muted-foreground"
+              )}
+            >
+              <p className={cn(
+                "text-[0.8rem] transition-all duration-150",
+                limitAction === v ? "font-semibold text-destructive" : "font-normal text-muted-foreground"
+              )}>
+                {v === "inherit" ? "Global default" : v === "Reject" ? "Reject" : "Process partial"}
+              </p>
+            </div>
+          ))}
+        </div>
+        <p className="text-xs text-muted-foreground mt-1">
+          Over the limit: <strong>Reject</strong> returns 413; <strong>Process partial</strong> inspects
+          the buffered portion and lets the rest through.
+        </p>
 
         {/* Excluded rule IDs */}
         <div className="mt-4">

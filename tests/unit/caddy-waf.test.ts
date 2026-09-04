@@ -10,7 +10,14 @@
  *   "failed to readfile: open @coraza.conf-recommended: no such file or directory"
  */
 import { describe, it, expect } from 'vitest';
-import { buildWafHandler, resolveEffectiveWaf } from '../../src/lib/caddy-waf';
+import {
+  buildWafHandler,
+  buildWafHandlerEntry,
+  CORAZA_MAX_BODY_LIMIT,
+  findInvalidBodyLimitDirective,
+  parseBodyLimitMib,
+  resolveEffectiveWaf,
+} from '../../src/lib/caddy-waf';
 
 const baseWaf = {
   enabled: true,
@@ -18,6 +25,45 @@ const baseWaf = {
   load_owasp_crs: false,
   custom_directives: '',
 };
+
+// ---------------------------------------------------------------------------
+// SecRuleEngine mode is interpolated into the directive block, and WAF settings
+// are persisted without validation — so an unrecognised mode must never reach
+// the config, or it would smuggle in SecLang past the custom_directives
+// allowlist (e.g. disabling rules the allowlist explicitly refuses).
+// ---------------------------------------------------------------------------
+
+describe('buildWafHandler — SecRuleEngine mode sanitising', () => {
+  function directives(mode: string): string {
+    const handler = buildWafHandler({ ...baseWaf, mode: mode as typeof baseWaf.mode, load_owasp_crs: false });
+    return handler.directives as string;
+  }
+
+  it('passes through the three real Coraza engine modes', () => {
+    expect(directives('On')).toContain('SecRuleEngine On');
+    expect(directives('Off')).toContain('SecRuleEngine Off');
+    expect(directives('DetectionOnly')).toContain('SecRuleEngine DetectionOnly');
+  });
+
+  it('falls back to On for an unrecognised mode', () => {
+    expect(directives('bogus')).toContain('SecRuleEngine On');
+  });
+
+  it('does not let a newline in mode inject extra directives', () => {
+    const out = directives('On\nSecRuleRemoveById 1-999999');
+    expect(out).toContain('SecRuleEngine On');
+    expect(out).not.toContain('SecRuleRemoveById 1-999999');
+  });
+
+  it('always emits the audit log parts the event parser depends on', () => {
+    const out = directives('On');
+    // Part H carries the matched rules that waf-log-parser reads for rule
+    // attribution; losing it silently strips rule id/message/severity.
+    expect(out).toContain('SecAuditLogParts ABFHZ');
+    expect(out).toContain('SecAuditLog /logs/waf-audit.log');
+    expect(out).toContain('SecAuditLogFormat JSON');
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Regression: @-prefixed paths must not appear without load_owasp_crs
@@ -60,6 +106,59 @@ describe('buildWafHandler — without OWASP CRS', () => {
     const handler = buildWafHandler({ ...baseWaf, load_owasp_crs: false, custom_directives: '   ' });
     // The directives string should end with the last standard directive
     expect((handler.directives as string).trimEnd()).not.toMatch(/\s+$/);
+  });
+
+  it('allows request body limit directives from custom directives', () => {
+    const directives = [
+      'SecRequestBodyLimit 536870912',
+      'SecRequestBodyNoFilesLimit 536870912',
+    ].join('\n');
+    const handler = buildWafHandler({ ...baseWaf, custom_directives: directives });
+    expect(handler.directives).toContain('SecRequestBodyLimit 536870912');
+    expect(handler.directives).toContain('SecRequestBodyNoFilesLimit 536870912');
+  });
+
+  // Coraza refuses to build a WAF above 1 GiB, and coraza-caddy builds it while
+  // Caddy loads the config — so an out-of-range value doesn't just fail this
+  // host, it makes Caddy reject the whole document.
+  it('drops body limits Coraza would refuse rather than breaking the config load', () => {
+    const handler = buildWafHandler({
+      ...baseWaf,
+      custom_directives: [
+        'SecRequestBodyLimit 10737418240',
+        'SecRequestBodyInMemoryLimit 0',
+        'SecRequestBodyLimit 536870912',
+      ].join('\n'),
+    });
+    expect(handler.directives).not.toContain('10737418240');
+    expect(handler.directives).not.toContain('SecRequestBodyInMemoryLimit 0');
+    expect(handler.directives).toContain('SecRequestBodyLimit 536870912');
+  });
+
+  it('accepts a body limit exactly at Coraza\'s 1 GiB ceiling', () => {
+    const handler = buildWafHandler({
+      ...baseWaf,
+      custom_directives: `SecRequestBodyLimit ${CORAZA_MAX_BODY_LIMIT}`,
+    });
+    expect(handler.directives).toContain(`SecRequestBodyLimit ${CORAZA_MAX_BODY_LIMIT}`);
+  });
+
+  it('allows related constrained request body limit directives', () => {
+    const directives = [
+      'SecRequestBodyInMemoryLimit 131072',
+      'SecRequestBodyLimitAction ProcessPartial',
+    ].join('\n');
+    const handler = buildWafHandler({ ...baseWaf, custom_directives: directives });
+    expect(handler.directives).toContain('SecRequestBodyInMemoryLimit 131072');
+    expect(handler.directives).toContain('SecRequestBodyLimitAction ProcessPartial');
+  });
+
+  it('still rejects request body directives that can disable inspection', () => {
+    const handler = buildWafHandler({
+      ...baseWaf,
+      custom_directives: 'SecRequestBodyAccess Off',
+    });
+    expect(handler.directives).not.toContain('SecRequestBodyAccess Off');
   });
 });
 
@@ -253,66 +352,224 @@ describe('resolveEffectiveWaf — override mode', () => {
 });
 
 // ---------------------------------------------------------------------------
-// buildWafHandler — WebSocket bypass
+// buildWafHandlerEntry — WebSocket bypass (issue #195)
+//
+// Regression: enabling WAF on a proxy host mangled WebSocket connections into a
+// corrupt "HTTP/0.9" response. The coraza middleware wraps the response writer
+// to inspect the upstream response, and that wrapper breaks the 101 Switching
+// Protocols connection hijack. The previous `ctl:ruleEngine=off` SecLang bypass
+// did NOT help because it only disables rule evaluation, leaving the response
+// wrapper in place. The fix routes WebSocket upgrades AROUND the WAF handler at
+// the Caddy routing level via a subroute that excludes the upgrade request.
 // ---------------------------------------------------------------------------
 
-describe('buildWafHandler — WebSocket bypass (regression: silent WAF block on WS upgrade)', () => {
-  it('includes WebSocket bypass rule when allowWebsocket=true', () => {
-    const handler = buildWafHandler(baseWaf, true);
-    expect(handler.directives).toContain('Upgrade');
-    expect(handler.directives).toContain('websocket');
-    expect(handler.directives).toContain('ctl:ruleEngine=off');
+// Pull a deeply-nested handler tree apart for assertions
+function subrouteOf(entry: Record<string, unknown>) {
+  return entry as {
+    handler: string;
+    routes: Array<{ match: Array<Record<string, unknown>>; handle: Array<Record<string, unknown>> }>;
+  };
+}
+
+describe('buildWafHandlerEntry — WebSocket bypass', () => {
+  it('returns the bare WAF handler when allowWebsocket=false', () => {
+    const entry = buildWafHandlerEntry(baseWaf, false);
+    expect(entry.handler).toBe('waf');
+    expect(typeof entry.directives).toBe('string');
   });
 
-  it('bypass rule uses case-insensitive regex match for the Upgrade header value', () => {
-    const handler = buildWafHandler(baseWaf, true);
-    // The regex must catch both "websocket" and "WebSocket"
-    expect(handler.directives).toContain('(?i)');
+  it('returns the bare WAF handler when allowWebsocket not provided (default false)', () => {
+    const entry = buildWafHandlerEntry(baseWaf);
+    expect(entry.handler).toBe('waf');
   });
 
-  it('bypass rule is phase:1 so it fires before any OWASP CRS rules', () => {
-    const handler = buildWafHandler(baseWaf, true);
-    expect(handler.directives).toContain('phase:1');
+  it('wraps the WAF handler in a subroute when allowWebsocket=true', () => {
+    const entry = subrouteOf(buildWafHandlerEntry(baseWaf, true));
+    expect(entry.handler).toBe('subroute');
+    expect(entry.routes).toHaveLength(1);
+    // The inner route's only handler is the actual WAF handler
+    expect(entry.routes[0].handle).toHaveLength(1);
+    expect(entry.routes[0].handle[0].handler).toBe('waf');
   });
 
-  it('bypass rule uses nolog,noauditlog to avoid false-positive audit entries', () => {
-    const handler = buildWafHandler(baseWaf, true);
-    expect(handler.directives).toContain('nolog');
-    expect(handler.directives).toContain('noauditlog');
+  it('subroute matches everything EXCEPT WebSocket upgrade requests', () => {
+    const entry = subrouteOf(buildWafHandlerEntry(baseWaf, true));
+    const match = entry.routes[0].match[0];
+    // A `not` matcher on the WebSocket upgrade headers — WAF runs for non-WS only
+    const not = match.not as Array<Record<string, unknown>>;
+    expect(Array.isArray(not)).toBe(true);
+    const header = not[0].header as Record<string, string[]>;
+    expect(header.Connection).toEqual(['*Upgrade*']);
+    expect(header.Upgrade).toEqual(['websocket']);
   });
 
-  it('bypass rule appears BEFORE OWASP CRS includes when both are enabled', () => {
-    const handler = buildWafHandler({ ...baseWaf, load_owasp_crs: true }, true);
-    const directives = handler.directives as string;
-    const wsPos = directives.indexOf('ctl:ruleEngine=off');
-    const crsPos = directives.indexOf('@owasp_crs');
-    expect(wsPos).toBeGreaterThanOrEqual(0);
-    expect(crsPos).toBeGreaterThanOrEqual(0);
-    expect(wsPos).toBeLessThan(crsPos);
+  it('does NOT emit a ctl:ruleEngine=off SecLang bypass (the broken approach)', () => {
+    const entry = subrouteOf(buildWafHandlerEntry(baseWaf, true));
+    const directives = entry.routes[0].handle[0].directives as string;
+    expect(directives).not.toContain('ctl:ruleEngine=off');
   });
 
-  it('does NOT include WebSocket bypass rule when allowWebsocket=false', () => {
-    const handler = buildWafHandler(baseWaf, false);
-    expect(handler.directives).not.toContain('ctl:ruleEngine=off');
+  it('preserves the full WAF directive set inside the bypass subroute', () => {
+    const entry = subrouteOf(buildWafHandlerEntry({ ...baseWaf, load_owasp_crs: true }, true));
+    const wafHandler = entry.routes[0].handle[0];
+    const directives = wafHandler.directives as string;
+    expect(directives).toContain('SecRuleEngine On');
+    expect(directives).toContain('SecAuditEngine RelevantOnly');
+    expect(directives).toContain('Include @owasp_crs/*.conf');
+    // load_owasp_crs flag must survive the wrapping
+    expect(wafHandler.load_owasp_crs).toBe(true);
   });
 
-  it('does NOT include WebSocket bypass rule when allowWebsocket not provided (default false)', () => {
-    const handler = buildWafHandler(baseWaf);
-    expect(handler.directives).not.toContain('ctl:ruleEngine=off');
-  });
-
-  it('still includes all standard directives alongside the bypass rule', () => {
-    const handler = buildWafHandler(baseWaf, true);
-    expect(handler.directives).toContain('SecRuleEngine On');
-    expect(handler.directives).toContain('SecAuditEngine RelevantOnly');
-  });
-
-  it('bypass rule is compatible with custom directives (both present)', () => {
-    const handler = buildWafHandler({
+  it('keeps custom directives inside the bypass subroute', () => {
+    const entry = subrouteOf(buildWafHandlerEntry({
       ...baseWaf,
       custom_directives: 'SecRule ARGS "@contains evil" "id:9001,deny"',
-    }, true);
-    expect(handler.directives).toContain('ctl:ruleEngine=off');
-    expect(handler.directives).toContain('SecRule ARGS "@contains evil"');
+    }, true));
+    const directives = entry.routes[0].handle[0].directives as string;
+    expect(directives).toContain('SecRule ARGS "@contains evil"');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dedicated request body limit settings (#252)
+//
+// Coraza's WAF is built while Caddy loads the config, so every value emitted
+// here has to satisfy Coraza's validation up front: <= 1 GiB, and the
+// in-memory limit no larger than the request limit. A violation rejects the
+// whole config document, leaving every host unapplied.
+// ---------------------------------------------------------------------------
+
+describe('buildWafHandler — request body limit settings', () => {
+  it('emits the configured limits as SecLang directives', () => {
+    const handler = buildWafHandler({
+      ...baseWaf,
+      request_body_limit: 536870912,
+      request_body_in_memory_limit: 1048576,
+      request_body_limit_action: 'ProcessPartial',
+    });
+    const directives = handler.directives as string;
+    expect(directives).toContain('SecRequestBodyLimit 536870912');
+    expect(directives).toContain('SecRequestBodyInMemoryLimit 1048576');
+    expect(directives).toContain('SecRequestBodyLimitAction ProcessPartial');
+  });
+
+  it('emits nothing when the limits are unset', () => {
+    const directives = buildWafHandler(baseWaf).directives as string;
+    expect(directives).not.toContain('SecRequestBodyLimit');
+    expect(directives).not.toContain('SecRequestBodyLimitAction');
+  });
+
+  it('overrides the CRS default by ordering the limit after the include', () => {
+    const directives = buildWafHandler({
+      ...baseWaf,
+      load_owasp_crs: true,
+      request_body_limit: 536870912,
+    }).directives as string;
+    const includeAt = directives.indexOf('Include @coraza.conf-recommended');
+    const limitAt = directives.indexOf('SecRequestBodyLimit 536870912');
+    expect(includeAt).toBeGreaterThanOrEqual(0);
+    expect(limitAt).toBeGreaterThan(includeAt);
+  });
+
+  it('lets custom directives win over the settings fields', () => {
+    const directives = buildWafHandler({
+      ...baseWaf,
+      request_body_limit: 536870912,
+      custom_directives: 'SecRequestBodyLimit 268435456',
+    }).directives as string;
+    expect(directives.indexOf('SecRequestBodyLimit 268435456'))
+      .toBeGreaterThan(directives.indexOf('SecRequestBodyLimit 536870912'));
+  });
+
+  it('ignores out-of-range and unknown values instead of emitting them', () => {
+    const directives = buildWafHandler({
+      ...baseWaf,
+      request_body_limit: 10737418240,
+      request_body_in_memory_limit: 0,
+      request_body_limit_action: 'Off' as never,
+    }).directives as string;
+    expect(directives).not.toContain('SecRequestBodyLimit');
+    expect(directives).not.toContain('SecRequestBodyLimitAction');
+  });
+
+  // Coraza validates the FINAL values, so the corrective line at the end wins.
+  it('clamps an in-memory limit that would exceed the request limit', () => {
+    const directives = buildWafHandler({
+      ...baseWaf,
+      load_owasp_crs: true,
+      custom_directives: 'SecRequestBodyInMemoryLimit 268435456',
+    }).directives as string;
+    // CRS caps the request body at 12.5 MiB, so 256 MiB in memory is invalid.
+    expect(directives.trimEnd().endsWith('SecRequestBodyInMemoryLimit 13107200')).toBe(true);
+  });
+
+  it('leaves a valid limit pair untouched', () => {
+    const directives = buildWafHandler({
+      ...baseWaf,
+      load_owasp_crs: true,
+      request_body_limit: 536870912,
+      request_body_in_memory_limit: 268435456,
+    }).directives as string;
+    expect(directives.match(/SecRequestBodyInMemoryLimit/g)).toHaveLength(1);
+  });
+});
+
+describe('resolveEffectiveWaf — body limits', () => {
+  const globalWaf = {
+    enabled: true,
+    mode: 'On' as const,
+    load_owasp_crs: true,
+    custom_directives: '',
+    request_body_limit: 134217728,
+    request_body_limit_action: 'Reject' as const,
+  };
+
+  it('lets a host override the global limit in merge mode', () => {
+    const effective = resolveEffectiveWaf(globalWaf, { enabled: true, request_body_limit: 536870912 });
+    expect(effective?.request_body_limit).toBe(536870912);
+    expect(effective?.request_body_limit_action).toBe('Reject');
+  });
+
+  it('inherits the global limit when the host leaves it unset', () => {
+    const effective = resolveEffectiveWaf(globalWaf, { enabled: true });
+    expect(effective?.request_body_limit).toBe(134217728);
+  });
+
+  it('does not inherit the global limit in override mode', () => {
+    const effective = resolveEffectiveWaf(globalWaf, { enabled: true, waf_mode: 'override' });
+    expect(effective?.request_body_limit).toBeUndefined();
+  });
+});
+
+describe('findInvalidBodyLimitDirective', () => {
+  it('reports the offending line so the user gets a precise error', () => {
+    expect(findInvalidBodyLimitDirective('SecRequestBodyLimit 10737418240'))
+      .toBe('SecRequestBodyLimit 10737418240');
+  });
+
+  it('passes in-range limits, comments and unrelated directives', () => {
+    expect(findInvalidBodyLimitDirective([
+      '# raise the upload ceiling',
+      'SecRequestBodyLimit 536870912',
+      'SecRule ARGS "@contains evil" "id:9001,deny"',
+    ].join('\n'))).toBeNull();
+    expect(findInvalidBodyLimitDirective('')).toBeNull();
+    expect(findInvalidBodyLimitDirective(undefined)).toBeNull();
+  });
+});
+
+describe('parseBodyLimitMib', () => {
+  it('converts MiB to bytes and treats blank as unset', () => {
+    expect(parseBodyLimitMib('512', 'Limit')).toBe(536870912);
+    expect(parseBodyLimitMib('', 'Limit')).toBeUndefined();
+    expect(parseBodyLimitMib('  ', 'Limit')).toBeUndefined();
+    expect(parseBodyLimitMib(null, 'Limit')).toBeUndefined();
+  });
+
+  it('rejects values Coraza would refuse', () => {
+    expect(() => parseBodyLimitMib('1025', 'Limit')).toThrow(/between 1 and 1024/);
+    expect(() => parseBodyLimitMib('0', 'Limit')).toThrow();
+    expect(() => parseBodyLimitMib('1.5', 'Limit')).toThrow();
+    expect(() => parseBodyLimitMib('abc', 'Limit')).toThrow();
   });
 });

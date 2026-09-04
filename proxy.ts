@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 import crypto from "node:crypto";
 import { auth } from "@/src/lib/auth";
+import { buildCsp } from "@/src/lib/csp";
 
 /**
  * Next.js Proxy for route protection.
@@ -10,30 +11,6 @@ import { auth } from "@/src/lib/auth";
  *
  * Note: Proxy always runs on Node.js runtime.
  */
-
-const isDev = process.env.NODE_ENV === "development";
-
-/**
- * Build a nonce-based Content-Security-Policy per request.
- * Next.js reads the nonce from the CSP request header and applies it
- * to all inline scripts it generates.
- */
-function buildCsp(nonce: string): string {
-  const directives = [
-    "default-src 'self'",
-    isDev
-      ? `script-src 'self' 'nonce-${nonce}' 'unsafe-eval' https://cdn.jsdelivr.net`
-      : `script-src 'self' 'nonce-${nonce}' https://cdn.jsdelivr.net`,
-    // style-src still needs 'unsafe-inline' for React JSX inline style props
-    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net",
-    "font-src 'self' https://fonts.gstatic.com",
-    "img-src 'self' data: blob:",
-    "worker-src blob:",
-    "connect-src 'self'",
-    "frame-ancestors 'none'",
-  ];
-  return directives.join("; ");
-}
 
 export default async function middleware(req: NextRequest) {
   const pathname = req.nextUrl.pathname;
@@ -48,7 +25,15 @@ export default async function middleware(req: NextRequest) {
     pathname.startsWith("/api/v1/") ||
     pathname.startsWith("/api/forward-auth/")
   ) {
-    return NextResponse.next();
+    const publicResponse = NextResponse.next();
+    // Anti-clickjacking for public pages (/login, /portal): the authenticated
+    // branch below sets the full security-header set, but public pages returned
+    // here previously carried none, leaving the login and forward-auth portal
+    // forms framable. Apply the framing protections to every public response.
+    publicResponse.headers.set("X-Frame-Options", "DENY");
+    publicResponse.headers.set("Content-Security-Policy", "frame-ancestors 'none'");
+    publicResponse.headers.set("X-Content-Type-Options", "nosniff");
+    return publicResponse;
   }
 
   // Check authentication for protected routes
@@ -90,8 +75,12 @@ export const config = {
      * - _next/static (static files)
      * - _next/image (image optimization files)
      * - favicon.ico (favicon file)
+     * - maplibre (maplibre-gl's tile worker bundle, staged into public/ at
+     *   build time; it must load as a module script even if the session has
+     *   expired, otherwise the redirect to /login is parsed as JS and the
+     *   analytics map silently breaks)
      * - public folder
      */
-    "/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)",
+    "/((?!_next/static|_next/image|favicon.ico|maplibre/|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)",
   ],
 };

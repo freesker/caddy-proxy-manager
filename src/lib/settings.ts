@@ -1,6 +1,13 @@
 import db, { nowIso } from "./db";
 import { settings } from "./db/schema";
 import { eq } from "drizzle-orm";
+import { sanitizeErrorPageRules, type ErrorPageRule } from "./models/proxy-hosts";
+import {
+  normalizeDefaultResponseSettings,
+  type DefaultResponseSettings,
+} from "./caddy-default-response";
+
+export type { DefaultResponseSettings } from "./caddy-default-response";
 
 export type SettingValue<T> = T | null;
 
@@ -13,6 +20,13 @@ export type CloudflareSettings = {
 export type GeneralSettings = {
   primaryDomain: string;
   acmeEmail?: string;
+};
+
+export type AcmeSettings = {
+  /** Custom ACME directory URL (e.g. an internal CA). Empty = Let's Encrypt default. */
+  caUrl?: string;
+  /** PEM-encoded trusted root for the ACME CA's HTTPS endpoint, if not in the system trust store. */
+  caRootPem?: string;
 };
 
 export type AuthentikSettings = {
@@ -29,6 +43,22 @@ export type MetricsSettings = {
 export type LoggingSettings = {
   enabled: boolean;
   format?: "json" | "console"; // Log format (default: json)
+};
+
+export type TrustedProxiesSettings = {
+  // Proxy ranges to trust for X-Forwarded-For / client IP resolution at the
+  // server level (Caddy `trusted_proxies`). Accepts CIDRs, bare IPs, and the
+  // "private_ranges" shorthand. Empty = feature disabled (current behaviour).
+  ranges: string[];
+  // Headers Caddy reads the real client IP from (Caddy `client_ip_headers`).
+  // Empty = Caddy default of X-Forwarded-For. Useful for e.g. Cf-Connecting-Ip.
+  client_ip_headers?: string[];
+  // Only trust client_ip_headers from the configured proxies, rejecting
+  // spoofed values from untrusted peers (Caddy `trusted_proxies_strict`).
+  strict?: boolean;
+  // When true, use `ranges` as the default trusted-proxy list for global
+  // geoblocking so the two settings can't silently disagree.
+  default_geoblock?: boolean;
 };
 
 export type DnsSettings = {
@@ -105,6 +135,15 @@ export async function getSetting<T>(key: string): Promise<SettingValue<T>> {
 }
 
 async function getInstanceModeForSettings(): Promise<InstanceMode> {
+  // Environment variable takes precedence — mirrors getInstanceMode() in
+  // instance-sync.ts. An env-configured slave never writes the mode to the DB
+  // (setInstanceMode refuses when env-set), so reading the DB alone here would
+  // report "standalone" and getEffectiveSetting would never serve synced:* values.
+  const envMode = process.env.INSTANCE_MODE;
+  if (envMode === "master" || envMode === "slave" || envMode === "standalone") {
+    return envMode;
+  }
+
   const stored = await getSetting<string>(INSTANCE_MODE_KEY);
   if (stored === "master" || stored === "slave" || stored === "standalone") {
     return stored;
@@ -170,6 +209,14 @@ export async function saveGeneralSettings(settings: GeneralSettings): Promise<vo
   await setSetting("general", settings);
 }
 
+export async function getAcmeSettings(): Promise<AcmeSettings | null> {
+  return await getEffectiveSetting<AcmeSettings>("acme");
+}
+
+export async function saveAcmeSettings(settings: AcmeSettings): Promise<void> {
+  await setSetting("acme", settings);
+}
+
 export async function getAuthentikSettings(): Promise<AuthentikSettings | null> {
   return await getEffectiveSetting<AuthentikSettings>("authentik");
 }
@@ -192,6 +239,14 @@ export async function getLoggingSettings(): Promise<LoggingSettings | null> {
 
 export async function saveLoggingSettings(settings: LoggingSettings): Promise<void> {
   await setSetting("logging", settings);
+}
+
+export async function getTrustedProxiesSettings(): Promise<TrustedProxiesSettings | null> {
+  return await getEffectiveSetting<TrustedProxiesSettings>("trusted_proxies");
+}
+
+export async function saveTrustedProxiesSettings(settings: TrustedProxiesSettings): Promise<void> {
+  await setSetting("trusted_proxies", settings);
 }
 
 export async function getDnsSettings(): Promise<DnsSettings | null> {
@@ -239,10 +294,20 @@ export async function saveGeoBlockSettings(settings: GeoBlockSettings): Promise<
 
 export type WafSettings = {
   enabled: boolean;
-  mode: 'Off' | 'On';
+  // Coraza's SecRuleEngine values. DetectionOnly is settable through the REST
+  // API (the UI only offers Off/On); buildWafHandler rejects anything else.
+  mode: 'Off' | 'On' | 'DetectionOnly';
   load_owasp_crs: boolean;
   custom_directives: string;
   excluded_rule_ids?: number[];
+  // Request body limits, in bytes. Unset means Coraza's own default applies
+  // (12.5 MiB from @coraza.conf-recommended when load_owasp_crs is on, else
+  // 128 MiB). Coraza caps both at 1 GiB — see CORAZA_MAX_BODY_LIMIT.
+  request_body_limit?: number;
+  request_body_in_memory_limit?: number;
+  // ProcessPartial inspects the leading bytes and forwards the rest instead of
+  // rejecting oversized uploads outright.
+  request_body_limit_action?: 'Reject' | 'ProcessPartial';
 };
 
 export async function getWafSettings(): Promise<WafSettings | null> {
@@ -251,4 +316,36 @@ export async function getWafSettings(): Promise<WafSettings | null> {
 
 export async function saveWafSettings(s: WafSettings): Promise<void> {
   await setSetting("waf", s);
+}
+
+// Global error pages, applied as fallback error routes across every proxy host.
+// Per-host error pages take precedence over these.
+export type ErrorPagesSettings = {
+  rules: ErrorPageRule[];
+};
+
+export async function getErrorPagesSettings(): Promise<ErrorPagesSettings | null> {
+  return await getEffectiveSetting<ErrorPagesSettings>("error_pages");
+}
+
+export async function saveErrorPagesSettings(s: ErrorPagesSettings): Promise<void> {
+  await setSetting("error_pages", { rules: sanitizeErrorPageRules(s?.rules) });
+}
+
+// Response for requests that do not match any configured proxy host. A missing
+// setting (or mode "caddy") preserves Caddy's native routing/HTTPS behavior.
+export async function getDefaultResponseSettings(): Promise<DefaultResponseSettings | null> {
+  const value = await getEffectiveSetting<unknown>("default_response");
+  if (value === null) return null;
+
+  try {
+    return normalizeDefaultResponseSettings(value);
+  } catch (error) {
+    console.warn("Ignoring invalid default response settings", error);
+    return null;
+  }
+}
+
+export async function saveDefaultResponseSettings(value: DefaultResponseSettings): Promise<void> {
+  await setSetting("default_response", normalizeDefaultResponseSettings(value));
 }
